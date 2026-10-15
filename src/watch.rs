@@ -44,13 +44,6 @@ impl DnsEvent {
             DnsEvent::ResourceRemoved { resource } => resource,
         }
     }
-
-    fn into_owned(self) -> (ResourceId, bool) {
-        match self {
-            DnsEvent::ResourceChanged { resource } => (resource, false),
-            DnsEvent::ResourceRemoved { resource } => (resource, true),
-        }
-    }
 }
 
 /// Callback invoked by a backend's event thread.
@@ -83,6 +76,7 @@ pub type WatchCallback = Arc<dyn Fn(&DnsEvent) + Send + Sync>;
 /// ```
 pub struct WatchHandle {
     flag: Arc<AtomicBool>,
+    pub(crate) delivery: Option<Arc<AtomicBool>>,
     cancel: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
@@ -91,12 +85,23 @@ impl WatchHandle {
     pub(crate) fn new(flag: Arc<AtomicBool>, cancel: impl FnOnce() + Send + 'static) -> Self {
         Self {
             flag,
+            delivery: None,
             cancel: Mutex::new(Some(Box::new(cancel))),
         }
     }
 
-    pub(crate) fn is_active(&self) -> bool {
+    /// Whether native observation and callback delivery remain operational.
+    /// Worker termination deactivates this state while the handle remains owned.
+    pub fn is_active(&self) -> bool {
         !self.flag.load(Ordering::Acquire)
+            && !self
+                .delivery
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.flag)
     }
 
     /// Stops the watch and releases the underlying native notification.
@@ -112,6 +117,14 @@ impl WatchHandle {
         if let Some(cancel) = self.cancel.lock().take() {
             cancel();
         }
+    }
+}
+
+pub(crate) struct WatchWorker(pub(crate) Arc<AtomicBool>);
+
+impl Drop for WatchWorker {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -134,7 +147,7 @@ impl fmt::Debug for WatchHandle {
 /// being reported as external changes.
 #[derive(Debug, Default)]
 pub(crate) struct SuppressionRegistry {
-    entries: Mutex<HashMap<ResourceId, Instant>>,
+    entries: Mutex<HashMap<ResourceId, (Instant, crate::platform::PlatformSnapshot)>>,
 }
 
 impl SuppressionRegistry {
@@ -144,21 +157,27 @@ impl SuppressionRegistry {
         Self::default()
     }
 
-    pub(crate) fn suppress(&self, resource: &ResourceId) {
+    pub(crate) fn record(&self, snapshot: &crate::platform::PlatformSnapshot) {
         let mut entries = self.entries.lock();
         Self::prune(&mut entries);
-        entries.insert(resource.clone(), Instant::now());
+        entries.insert(
+            snapshot.resource.clone(),
+            (Instant::now(), snapshot.clone()),
+        );
     }
 
-    pub(crate) fn is_suppressed(&self, resource: &ResourceId) -> bool {
+    pub(crate) fn snapshot(
+        &self,
+        resource: &ResourceId,
+    ) -> Option<crate::platform::PlatformSnapshot> {
         let mut entries = self.entries.lock();
         Self::prune(&mut entries);
-        entries.contains_key(resource)
+        entries.get(resource).map(|(_, snapshot)| snapshot.clone())
     }
 
-    fn prune(entries: &mut HashMap<ResourceId, Instant>) {
+    fn prune(entries: &mut HashMap<ResourceId, (Instant, crate::platform::PlatformSnapshot)>) {
         let now = Instant::now();
-        entries.retain(|_, suppressed_at| now.duration_since(*suppressed_at) < Self::WINDOW);
+        entries.retain(|_, (suppressed_at, _)| now.duration_since(*suppressed_at) < Self::WINDOW);
     }
 }
 
@@ -167,7 +186,7 @@ impl SuppressionRegistry {
 ///
 /// The returned callback replaces the latest pending event for its resource
 /// and signals a capacity-one wake channel with `try_send`. A dedicated
-/// thread flushes once the stream stays quiet for `window`.
+/// thread flushes the latest events at the end of each bounded `window`.
 pub(crate) fn spawn_coalescer(
     kind: BackendKind,
     callback: WatchCallback,
@@ -176,10 +195,16 @@ pub(crate) fn spawn_coalescer(
     let pending = Arc::new(Mutex::new(HashMap::<ResourceId, DnsEvent>::new()));
     let worker_pending = Arc::clone(&pending);
     let (wake, rx) = mpsc::sync_channel::<()>(1);
+    let flag = Arc::new(AtomicBool::new(false));
+    let worker_flag = Arc::clone(&flag);
     let worker = thread::Builder::new()
         .name("osdns-watch-coalescer".to_string())
         .spawn(move || {
+            let _lifetime = WatchWorker(Arc::clone(&worker_flag));
             while rx.recv().is_ok() {
+                if worker_flag.load(Ordering::Acquire) {
+                    break;
+                }
                 let deadline = Instant::now() + window;
                 loop {
                     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -187,33 +212,44 @@ pub(crate) fn spawn_coalescer(
                         break;
                     }
                     match rx.recv_timeout(remaining) {
+                        Ok(()) if worker_flag.load(Ordering::Acquire) => return,
                         Ok(()) => {}
                         Err(mpsc::RecvTimeoutError::Timeout) => break,
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            flush(&callback, &worker_pending);
+                            flush(&callback, &worker_pending, &worker_flag);
                             return;
                         }
                     }
                 }
-                flush(&callback, &worker_pending);
+                flush(&callback, &worker_pending, &worker_flag);
             }
         })
         .map_err(|e| Error::Platform {
             backend: kind,
             message: format!("cannot spawn coalescer thread: {e}"),
         })?;
+    let callback_flag = Arc::clone(&flag);
+    let callback_wake = wake.clone();
     let sender: WatchCallback = Arc::new(move |event| {
-        let (resource, _) = event.clone().into_owned();
-        pending.lock().insert(resource, event.clone());
-        let _ = wake.try_send(());
+        if callback_flag.load(Ordering::Acquire) {
+            return;
+        }
+        pending
+            .lock()
+            .insert(event.resource().clone(), event.clone());
+        let _ = callback_wake.try_send(());
     });
     Ok(Coalescer {
+        flag,
+        wake,
         sender: Some(sender),
         worker: Some(worker),
     })
 }
 
 pub(crate) struct Coalescer {
+    pub(crate) flag: Arc<AtomicBool>,
+    wake: mpsc::SyncSender<()>,
     sender: Option<WatchCallback>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -224,8 +260,16 @@ impl Coalescer {
     }
 
     pub(crate) fn stop(mut self) {
+        self.deactivate();
+    }
+
+    fn deactivate(&mut self) {
+        self.flag.store(true, Ordering::Release);
+        let _ = self.wake.try_send(());
         self.sender.take();
-        if let Some(worker) = self.worker.take() {
+        if let Some(worker) = self.worker.take()
+            && worker.thread().id() != thread::current().id()
+        {
             let _ = worker.join();
         }
     }
@@ -233,22 +277,25 @@ impl Coalescer {
 
 impl Drop for Coalescer {
     fn drop(&mut self) {
-        self.sender.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        self.deactivate();
     }
 }
 
-fn flush(callback: &WatchCallback, shared: &Mutex<HashMap<ResourceId, DnsEvent>>) {
-    let mut pending = {
+fn flush(
+    callback: &WatchCallback,
+    shared: &Mutex<HashMap<ResourceId, DnsEvent>>,
+    flag: &AtomicBool,
+) {
+    let pending = {
         let mut shared = shared.lock();
         std::mem::take(&mut *shared)
     };
     for event in pending.values() {
+        if flag.load(Ordering::Acquire) {
+            break;
+        }
         callback(event);
     }
-    pending.clear();
 }
 
 #[cfg(test)]
@@ -256,26 +303,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coalescer_delivers_the_last_observed_state() {
-        let delivered = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&delivered);
+    fn coalescer_delivers_the_last_event_from_a_burst() {
+        let (sent, received) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let blocked = Mutex::new(blocked);
         let coalescer = spawn_coalescer(
             BackendKind::Fake,
-            Arc::new(move |event| sink.lock().push(event.clone())),
+            Arc::new(move |event| {
+                sent.send(event.clone()).unwrap();
+                blocked.lock().recv_timeout(Duration::from_secs(2)).unwrap();
+            }),
             Duration::from_millis(5),
         )
         .unwrap();
         let callback = coalescer.callback();
         let resource = ResourceId::new("fake:watch-state").unwrap();
-        callback(&DnsEvent::ResourceRemoved {
+        let changed = DnsEvent::ResourceChanged {
             resource: resource.clone(),
-        });
-        callback(&DnsEvent::ResourceChanged { resource });
-        drop(callback);
+        };
+        callback(&changed);
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            changed
+        );
+        for _ in 0..300 {
+            callback(&DnsEvent::ResourceRemoved {
+                resource: resource.clone(),
+            });
+        }
+        callback(&changed);
+        release.send(()).unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            changed
+        );
+        release.send(()).unwrap();
+        assert!(received.recv_timeout(Duration::from_millis(50)).is_err());
         coalescer.stop();
-        assert!(matches!(
-            delivered.lock().as_slice(),
-            [DnsEvent::ResourceChanged { .. }]
-        ));
+    }
+    #[test]
+    fn coalescer_stop_does_not_depend_on_sender_release() {
+        let coalescer = spawn_coalescer(
+            BackendKind::Fake,
+            Arc::new(|_| {}),
+            Duration::from_millis(5),
+        )
+        .unwrap();
+        let retained = coalescer.callback();
+        coalescer.stop();
+        drop(retained);
     }
 }

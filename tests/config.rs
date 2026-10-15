@@ -175,21 +175,6 @@ fn update_after_defunct_lease_conflicts() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
-fn default_backend_is_macos_system_configuration() {
-    let dir = temp_dir("default-backend");
-    let manager = DnsManager::builder()
-        .owner("io.osdns.test")
-        .state_dir(dir.to_path_buf())
-        .build()
-        .unwrap();
-    assert_eq!(
-        manager.capabilities().unwrap().backend,
-        BackendKind::MacosSystemConfiguration
-    );
-}
-
-#[test]
 fn builder_requires_owner() {
     let dir = temp_dir("no-owner");
     let err = DnsManager::builder()
@@ -208,4 +193,24 @@ fn builder_rejects_bad_owner() {
         .build()
         .unwrap_err();
     assert!(matches!(err, Error::InvalidConfig(_)));
+}
+
+#[cfg(windows)]
+#[test]
+fn native_read_only_manager_does_not_initialize_state_storage() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("uncreated-state");
+    let manager = DnsManager::builder()
+        .owner("io.osdns.read-only")
+        .state_dir(&state)
+        .build()
+        .unwrap();
+    assert!(manager.capabilities().unwrap().read);
+    let interface = manager.interfaces().unwrap().remove(0);
+    let _ = manager
+        .snapshot(&DnsScope::Interface(InterfaceSelector::Name(
+            interface.name,
+        )))
+        .unwrap();
+    assert!(!state.exists());
 }

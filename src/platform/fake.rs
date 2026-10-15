@@ -15,8 +15,8 @@ use crate::interface::InterfaceInfo;
 use crate::normalize::{DnsSuffix, NormalizedConfig};
 use crate::ownership::ResourceId;
 use crate::platform::{
-    ApplyReceipt, Backend, IdentityData, MutationAttempt, PlatformSnapshot, ResourceIdentity,
-    ResourceStatus, SnapshotData,
+    Backend, IdentityData, MutationAttempt, PlatformSnapshot, ResourceIdentity, ResourceStatus,
+    SnapshotData,
 };
 use crate::watch::{DnsEvent, WatchCallback, WatchHandle};
 
@@ -135,6 +135,8 @@ impl From<&DnsConfig> for FakeState {
 /// Which backend operation to fail when injecting faults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FakeOp {
+    /// Starting native observation.
+    Watch,
     /// Fail resource-incarnation validation.
     Identity,
     /// Fail capture.
@@ -206,6 +208,11 @@ struct WatchStartBlock {
 }
 
 impl FakeBackend {
+    pub(crate) fn fail_watches(&self) {
+        for (flag, _) in self.watchers.lock().iter() {
+            flag.store(true, Ordering::Release);
+        }
+    }
     pub(crate) fn new() -> Self {
         Self::with_capabilities(
             Capabilities::new(BackendKind::Fake)
@@ -721,7 +728,7 @@ impl Backend for FakeBackend {
         self.snapshot_of(resource)
     }
 
-    fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<ApplyReceipt> {
+    fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<()> {
         self.check_failure(FakeOp::Apply)?;
         let partial = {
             let mut inner = self.lock_inner();
@@ -755,9 +762,7 @@ impl Backend for FakeBackend {
                 format_args!("injected partial mutation before failure"),
             ));
         }
-        Ok(ApplyReceipt {
-            resource: resource.clone(),
-        })
+        Ok(())
     }
 
     fn readback(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
@@ -1046,6 +1051,7 @@ impl Backend for FakeBackend {
     }
 
     fn start_watch(&self, callback: WatchCallback) -> Result<WatchHandle> {
+        self.check_failure(FakeOp::Watch)?;
         if !self.caps.watch {
             return Err(Error::unsupported(
                 BackendKind::Fake,

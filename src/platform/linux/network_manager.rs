@@ -3,12 +3,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
 
+use zbus::MatchRule;
 use zbus::blocking::Connection;
 use zbus::proxy;
 use zbus::zvariant::{Array, OwnedObjectPath, OwnedValue, Value};
-use zbus::{MatchRule, blocking::MessageIterator};
 
 use crate::capability::{BackendKind, Capabilities};
 use crate::config::{DnsConfig, DnsScope};
@@ -19,15 +18,12 @@ use crate::ownership::ResourceId;
 use crate::platform::linux;
 use crate::platform::text_config::{NmDnsFields, parse_nm_dns_fields};
 use crate::platform::{
-    ApplyReceipt, Backend, IdentityData, PlatformSnapshot, ResourceIdentity, ResourceStatus,
-    SnapshotData,
+    Backend, IdentityData, PlatformSnapshot, ResourceIdentity, ResourceStatus, SnapshotData,
 };
 use crate::watch::{DnsEvent, WatchCallback, WatchHandle};
 
 const NM_SERVICE: &str = "org.freedesktop.NetworkManager";
 const NM_PATH: &str = "/org/freedesktop/NetworkManager";
-const REAPPLY_ATTEMPTS: u32 = 3;
-const REAPPLY_BACKOFF: Duration = Duration::from_millis(150);
 
 #[proxy(
     interface = "org.freedesktop.NetworkManager",
@@ -81,7 +77,7 @@ type OwnedSettings = HashMap<String, HashMap<String, OwnedValue>>;
 type Settings = HashMap<String, HashMap<String, Value<'static>>>;
 
 pub(crate) struct NetworkManager {
-    conn: Connection,
+    conn: linux::BusConnection,
     caps: Capabilities,
     dns_mode: String,
     rc_manager: String,
@@ -99,7 +95,7 @@ impl NetworkManager {
         let rc_manager = dns.rc_manager().map_err(dbus_error)?;
         Ok(Self {
             caps: capabilities(&dns_mode),
-            conn,
+            conn: linux::BusConnection::new(conn),
             dns_mode,
             rc_manager,
         })
@@ -109,14 +105,98 @@ impl NetworkManager {
         (&self.dns_mode, &self.rc_manager)
     }
 
+    fn mutate_bound(
+        &self,
+        identity: &ResourceIdentity,
+        expected: &PlatformSnapshot,
+        fields: &NmDnsFields,
+        operation: &str,
+    ) -> crate::platform::MutationAttempt {
+        if let Err(error) = self.conn.verify_namespace(NM_SERVICE, self.kind()) {
+            return crate::platform::MutationAttempt::Rejected { error };
+        }
+
+        if let Err(error) = match self.resource_status(identity) {
+            Ok(ResourceStatus::Same) => Ok(()),
+            Ok(status) => Err(Error::ResourceIdentity {
+                backend: BackendKind::NetworkManager,
+                resource: identity.resource.clone(),
+                message: format!("activation is {status:?}; refusing {operation}"),
+            }),
+            Err(error) => Err(error),
+        } {
+            return crate::platform::MutationAttempt::Rejected { error };
+        }
+        let recorded = match NmResourceIdentity::decode(identity) {
+            Ok(recorded) => recorded,
+            Err(error) => return crate::platform::MutationAttempt::Rejected { error },
+        };
+        let path =
+            OwnedObjectPath::try_from(recorded.device_path.as_str()).expect("validated path");
+        let connection = match self.conn.get() {
+            Ok(connection) => connection,
+            Err(error) => {
+                return crate::platform::MutationAttempt::Rejected {
+                    error: dbus_error(error),
+                };
+            }
+        };
+        let device = match NmDeviceProxyBlocking::builder(&connection)
+            .destination(recorded.service_owner.clone())
+            .and_then(|builder| builder.path(path))
+            .and_then(|builder| builder.build())
+        {
+            Ok(device) => device,
+            Err(error) => {
+                return crate::platform::MutationAttempt::Rejected {
+                    error: dbus_error(error),
+                };
+            }
+        };
+        let (device, live_settings, expected_version) =
+            match self.guarded_baseline_device(&identity.resource, device, expected) {
+                Ok(value) => value,
+                Err(error) => return crate::platform::MutationAttempt::Rejected { error },
+            };
+        match self.resource_status(identity) {
+            Ok(ResourceStatus::Same) => {}
+            Ok(status) => {
+                return crate::platform::MutationAttempt::Rejected {
+                    error: Error::ResourceIdentity {
+                        backend: BackendKind::NetworkManager,
+                        resource: identity.resource.clone(),
+                        message: format!("activation became {status:?} before {operation}"),
+                    },
+                };
+            }
+            Err(error) => return crate::platform::MutationAttempt::Rejected { error },
+        }
+        let mut settings = to_owned_static(&live_settings);
+        Self::with_dns_fields(&mut settings, fields);
+        match self.reapply_versioned(&device, settings, expected_version) {
+            Ok(()) => crate::platform::MutationAttempt::Performed { produced: None },
+            Err(error) => crate::platform::MutationAttempt::Indeterminate {
+                error: self.map_reapply_error(
+                    &identity.resource,
+                    &device,
+                    expected_version,
+                    operation,
+                    error,
+                ),
+                produced: None,
+            },
+        }
+    }
+
     fn manager(&self) -> Result<NmManagerProxyBlocking<'_>> {
-        NmManagerProxyBlocking::builder(&self.conn)
+        NmManagerProxyBlocking::builder(&self.conn.get().map_err(dbus_error)?)
             .build()
             .map_err(dbus_error)
     }
 
     fn service_owner(&self) -> Result<String> {
-        let proxy = zbus::blocking::fdo::DBusProxy::new(&self.conn).map_err(dbus_error)?;
+        let proxy = zbus::blocking::fdo::DBusProxy::new(&self.conn.get().map_err(dbus_error)?)
+            .map_err(dbus_error)?;
         let name = NM_SERVICE.try_into().map_err(|e| {
             Error::platform(
                 BackendKind::NetworkManager,
@@ -133,7 +213,7 @@ impl NetworkManager {
     }
 
     fn device(&self, path: OwnedObjectPath) -> Result<NmDeviceProxyBlocking<'_>> {
-        NmDeviceProxyBlocking::builder(&self.conn)
+        NmDeviceProxyBlocking::builder(&self.conn.get().map_err(dbus_error)?)
             .path(path)
             .map_err(dbus_error)?
             .build()
@@ -200,10 +280,6 @@ impl NetworkManager {
         );
     }
 
-    fn reapply(&self, device: &NmDeviceProxyBlocking, settings: Settings) -> Result<()> {
-        self.reapply_versioned(device, settings, 0)
-    }
-
     /// Reapplies with an expected `version_id` for compare-and-swap. A
     /// non-zero version asks NetworkManager to reject the call when the
     /// applied connection changed underneath us.
@@ -213,18 +289,10 @@ impl NetworkManager {
         settings: Settings,
         version: u64,
     ) -> Result<()> {
-        let mut attempts = 0;
-        loop {
-            match device.reapply(settings.clone(), version, 0) {
-                Ok(_result) => return Ok(()),
-                Err(error) if attempts + 1 < REAPPLY_ATTEMPTS && version == 0 => {
-                    attempts += 1;
-                    thread::sleep(REAPPLY_BACKOFF);
-                    let _ = error;
-                }
-                Err(error) => return Err(dbus_error(error)),
-            }
-        }
+        device
+            .reapply(settings, version, 0)
+            .map(|_| ())
+            .map_err(dbus_error)
     }
 
     fn to_platform_snapshot(
@@ -264,15 +332,6 @@ impl NetworkManager {
     /// Reads the live applied connection and refuses when it no longer
     /// matches the verified `expected` snapshot. Returns the live settings
     /// and the expected version for the caller to reapply under.
-    fn guarded_baseline(
-        &self,
-        resource: &ResourceId,
-        expected: &PlatformSnapshot,
-    ) -> Result<(NmDeviceProxyBlocking<'_>, OwnedSettings, u64)> {
-        let (device, _name) = self.device_for_resource(resource)?;
-        self.guarded_baseline_device(resource, device, expected)
-    }
-
     fn guarded_baseline_device<'a>(
         &'a self,
         resource: &ResourceId,
@@ -281,6 +340,12 @@ impl NetworkManager {
     ) -> Result<(NmDeviceProxyBlocking<'a>, OwnedSettings, u64)> {
         let expected_fields = Self::fields_from_snapshot(expected)?;
         let expected_version = Self::version_from_snapshot(expected);
+        if expected_version == 0 {
+            return Err(Error::unsupported(
+                self.kind(),
+                "NetworkManager returned no comparison version",
+            ));
+        }
         let (live_settings, live_version) = self.applied(&device)?;
         if parse_nm_dns_fields(&convert_settings(&live_settings)) != expected_fields {
             return Err(Error::ExternalModification {
@@ -289,7 +354,7 @@ impl NetworkManager {
                     .to_string(),
             });
         }
-        if expected_version != 0 && live_version != expected_version {
+        if live_version != expected_version {
             return Err(Error::ExternalModification {
                 resource: resource.clone(),
                 detail: format!(
@@ -310,8 +375,7 @@ impl NetworkManager {
         operation: &str,
         error: Error,
     ) -> Error {
-        if expected_version != 0
-            && let Ok((_, now)) = self.applied(device)
+        if let Ok((_, now)) = self.applied(device)
             && now != expected_version
         {
             return Error::ExternalModification {
@@ -348,8 +412,7 @@ fn dbus_error(error: zbus::Error) -> Error {
 pub(crate) struct NmSnapshotData {
     fields: crate::platform::text_config::NmDnsFields,
     /// `version_id` from `GetAppliedConnection` at capture time. `0`
-    /// carries no compare-and-swap token, so guarded operations using it
-    /// fall back to field comparison.
+    /// carries no comparison token and is rejected for mutation.
     version: u64,
 }
 
@@ -659,98 +722,18 @@ impl Backend for NetworkManager {
         Self::to_platform_snapshot(resource, &fields, version)
     }
 
-    fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<ApplyReceipt> {
-        let (device, _name) = self.device_for_resource(resource)?;
-        let (applied, _) = self.applied(&device)?;
-        let mut settings = to_owned_static(&applied);
-        let fields = NmDnsFields::from_plan(plan, self.caps.split_dns);
-        Self::with_dns_fields(&mut settings, &fields);
-        self.reapply(&device, settings)?;
-        Ok(ApplyReceipt {
-            resource: resource.clone(),
-        })
-    }
-
-    fn readback(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
-        let (device, _name) = self.device_for_resource(resource)?;
-        let (settings, version) = self.applied(&device)?;
-        let fields = parse_nm_dns_fields(&convert_settings(&settings));
-        Self::to_platform_snapshot(resource, &fields, version)
-    }
-
-    fn restore(&self, resource: &ResourceId, snapshot: &PlatformSnapshot) -> Result<()> {
-        let before = Self::fields_from_snapshot(snapshot)?;
-        let (device, _name) = self.device_for_resource(resource)?;
-        let (applied, _) = self.applied(&device)?;
-        let mut settings = to_owned_static(&applied);
-        Self::with_dns_fields(&mut settings, &before);
-        self.reapply(&device, settings)?;
-        Ok(())
-    }
-
     fn apply_bound(
         &self,
         identity: &ResourceIdentity,
         expected: &PlatformSnapshot,
         plan: &NormalizedConfig,
     ) -> crate::platform::MutationAttempt {
-        if let Err(error) = match self.resource_status(identity) {
-            Ok(ResourceStatus::Same) => Ok(()),
-            Ok(status) => Err(Error::ResourceIdentity {
-                backend: BackendKind::NetworkManager,
-                resource: identity.resource.clone(),
-                message: format!("activation is {status:?}; refusing reapply"),
-            }),
-            Err(error) => Err(error),
-        } {
-            return crate::platform::MutationAttempt::Rejected { error };
-        }
-        let recorded = match NmResourceIdentity::decode(identity) {
-            Ok(recorded) => recorded,
-            Err(error) => return crate::platform::MutationAttempt::Rejected { error },
-        };
-        let path =
-            OwnedObjectPath::try_from(recorded.device_path.as_str()).expect("validated path");
-        let device = match self.device(path) {
-            Ok(device) => device,
-            Err(error) => return crate::platform::MutationAttempt::Rejected { error },
-        };
-        let (device, live_settings, expected_version) =
-            match self.guarded_baseline_device(&identity.resource, device, expected) {
-                Ok(value) => value,
-                Err(error) => return crate::platform::MutationAttempt::Rejected { error },
-            };
-        match self.resource_status(identity) {
-            Ok(ResourceStatus::Same) => {}
-            Ok(status) => {
-                return crate::platform::MutationAttempt::Rejected {
-                    error: Error::ResourceIdentity {
-                        backend: BackendKind::NetworkManager,
-                        resource: identity.resource.clone(),
-                        message: format!("activation became {status:?} before reapply"),
-                    },
-                };
-            }
-            Err(error) => return crate::platform::MutationAttempt::Rejected { error },
-        }
-        let mut settings = to_owned_static(&live_settings);
-        Self::with_dns_fields(
-            &mut settings,
+        self.mutate_bound(
+            identity,
+            expected,
             &NmDnsFields::from_plan(plan, self.caps.split_dns),
-        );
-        match self.reapply_versioned(&device, settings, expected_version) {
-            Ok(()) => crate::platform::MutationAttempt::Performed { produced: None },
-            Err(error) => crate::platform::MutationAttempt::Indeterminate {
-                error: self.map_reapply_error(
-                    &identity.resource,
-                    &device,
-                    expected_version,
-                    "apply",
-                    error,
-                ),
-                produced: None,
-            },
-        }
+            "apply",
+        )
     }
 
     fn restore_bound(
@@ -759,174 +742,10 @@ impl Backend for NetworkManager {
         expected: &PlatformSnapshot,
         target: &PlatformSnapshot,
     ) -> crate::platform::MutationAttempt {
-        let before = match Self::fields_from_snapshot(target) {
-            Ok(fields) => fields,
-            Err(error) => return crate::platform::MutationAttempt::Rejected { error },
-        };
-        match self.resource_status(identity) {
-            Ok(ResourceStatus::Same) => {}
-            Ok(status) => {
-                return crate::platform::MutationAttempt::Rejected {
-                    error: Error::ResourceIdentity {
-                        backend: BackendKind::NetworkManager,
-                        resource: identity.resource.clone(),
-                        message: format!("activation is {status:?}; refusing restore"),
-                    },
-                };
-            }
-            Err(error) => return crate::platform::MutationAttempt::Rejected { error },
+        match Self::fields_from_snapshot(target) {
+            Ok(fields) => self.mutate_bound(identity, expected, &fields, "restore"),
+            Err(error) => crate::platform::MutationAttempt::Rejected { error },
         }
-        let recorded = match NmResourceIdentity::decode(identity) {
-            Ok(recorded) => recorded,
-            Err(error) => return crate::platform::MutationAttempt::Rejected { error },
-        };
-        let path =
-            OwnedObjectPath::try_from(recorded.device_path.as_str()).expect("validated path");
-        let device = match self.device(path) {
-            Ok(device) => device,
-            Err(error) => return crate::platform::MutationAttempt::Rejected { error },
-        };
-        let (device, live_settings, expected_version) =
-            match self.guarded_baseline_device(&identity.resource, device, expected) {
-                Ok(value) => value,
-                Err(error) => return crate::platform::MutationAttempt::Rejected { error },
-            };
-        match self.resource_status(identity) {
-            Ok(ResourceStatus::Same) => {}
-            Ok(status) => {
-                return crate::platform::MutationAttempt::Rejected {
-                    error: Error::ResourceIdentity {
-                        backend: BackendKind::NetworkManager,
-                        resource: identity.resource.clone(),
-                        message: format!("activation became {status:?} before restore"),
-                    },
-                };
-            }
-            Err(error) => return crate::platform::MutationAttempt::Rejected { error },
-        }
-        let mut settings = to_owned_static(&live_settings);
-        Self::with_dns_fields(&mut settings, &before);
-        match self.reapply_versioned(&device, settings, expected_version) {
-            Ok(()) => crate::platform::MutationAttempt::Performed { produced: None },
-            Err(error) => crate::platform::MutationAttempt::Indeterminate {
-                error: self.map_reapply_error(
-                    &identity.resource,
-                    &device,
-                    expected_version,
-                    "restore",
-                    error,
-                ),
-                produced: None,
-            },
-        }
-    }
-
-    fn apply_guarded(
-        &self,
-        resource: &ResourceId,
-        expected: &PlatformSnapshot,
-        plan: &NormalizedConfig,
-    ) -> crate::platform::MutationAttempt {
-        let (device, live_settings, expected_version) =
-            match self.guarded_baseline(resource, expected) {
-                Ok(baseline) => baseline,
-                Err(error) if error.is_external_modification() => {
-                    return crate::platform::MutationAttempt::Rejected { error };
-                }
-                Err(error) => {
-                    return crate::platform::MutationAttempt::Indeterminate {
-                        error,
-                        produced: None,
-                    };
-                }
-            };
-        let mut settings = to_owned_static(&live_settings);
-        let fields = NmDnsFields::from_plan(plan, self.caps.split_dns);
-        Self::with_dns_fields(&mut settings, &fields);
-        match self.reapply_versioned(&device, settings, expected_version) {
-            Ok(()) => crate::platform::MutationAttempt::Performed { produced: None },
-            Err(error) => {
-                let error =
-                    self.map_reapply_error(resource, &device, expected_version, "apply", error);
-                if error.is_external_modification() {
-                    crate::platform::MutationAttempt::Rejected { error }
-                } else {
-                    crate::platform::MutationAttempt::Indeterminate {
-                        error,
-                        produced: None,
-                    }
-                }
-            }
-        }
-    }
-
-    fn restore_guarded(
-        &self,
-        resource: &ResourceId,
-        expected: &PlatformSnapshot,
-        target: &PlatformSnapshot,
-    ) -> crate::platform::MutationAttempt {
-        let before = match Self::fields_from_snapshot(target) {
-            Ok(fields) => fields,
-            Err(error) => {
-                return crate::platform::MutationAttempt::Indeterminate {
-                    error,
-                    produced: None,
-                };
-            }
-        };
-        let (device, live_settings, expected_version) =
-            match self.guarded_baseline(resource, expected) {
-                Ok(baseline) => baseline,
-                Err(error) if error.is_external_modification() => {
-                    return crate::platform::MutationAttempt::Rejected { error };
-                }
-                Err(error) => {
-                    return crate::platform::MutationAttempt::Indeterminate {
-                        error,
-                        produced: None,
-                    };
-                }
-            };
-        let mut settings = to_owned_static(&live_settings);
-        Self::with_dns_fields(&mut settings, &before);
-        match self.reapply_versioned(&device, settings, expected_version) {
-            Ok(()) => crate::platform::MutationAttempt::Performed { produced: None },
-            Err(error) => {
-                let error =
-                    self.map_reapply_error(resource, &device, expected_version, "restore", error);
-                if error.is_external_modification() {
-                    crate::platform::MutationAttempt::Rejected { error }
-                } else {
-                    crate::platform::MutationAttempt::Indeterminate {
-                        error,
-                        produced: None,
-                    }
-                }
-            }
-        }
-    }
-
-    fn proves_current(&self, proof: &PlatformSnapshot, current: &PlatformSnapshot) -> bool {
-        let Ok(proof_data) = Self::snapshot_data(proof) else {
-            return false;
-        };
-        let Ok(current_data) = Self::snapshot_data(current) else {
-            return false;
-        };
-        proof_data.fields == current_data.fields
-            && proof_data.version != 0
-            && proof_data.version == current_data.version
-    }
-
-    fn validate_plan(&self, _scope: &DnsScope, plan: &NormalizedConfig) -> Result<()> {
-        if plan.default_route.is_some() {
-            return Err(Error::unsupported(
-                BackendKind::NetworkManager,
-                "NetworkManager has no explicit default-route flag; use the root routing domain instead",
-            ));
-        }
-        Ok(())
     }
 
     fn equivalent(&self, a: &PlatformSnapshot, b: &PlatformSnapshot) -> bool {
@@ -976,8 +795,7 @@ impl Backend for NetworkManager {
             .path_namespace(NM_PATH)
             .expect("valid path")
             .build();
-        let iterator =
-            MessageIterator::for_match_rule(rule, &conn, Some(64)).map_err(dbus_error)?;
+        let iterator = linux::watch_signals(&conn, rule, NM_SERVICE).map_err(dbus_error)?;
         let flag = Arc::new(AtomicBool::new(false));
         let watch_flag = flag.clone();
         let thread_conn = conn.clone();
@@ -985,11 +803,19 @@ impl Backend for NetworkManager {
         let worker = thread::Builder::new()
             .name("osdns-nm-watch".to_string())
             .spawn(move || {
+                let _lifetime = crate::watch::WatchWorker(Arc::clone(&watch_flag));
                 for message in iterator {
                     if watch_flag.load(Ordering::Acquire) {
                         break;
                     }
                     let Ok(message) = message else { break };
+                    if message
+                        .header()
+                        .member()
+                        .is_some_and(|member| member.as_str() == "NameOwnerChanged")
+                    {
+                        break;
+                    }
                     let path = match message.header().path() {
                         Some(path) => path.to_owned(),
                         None => continue,
