@@ -890,7 +890,7 @@ impl Inner {
             let mut guard = record.lock();
             guard.record.desired = plan.clone();
             guard.record.phase = Phase::Prepared;
-            guard.state = LiveState::Prepared;
+            guard.state = LiveState::Unmutated;
             // `applied` still carries the previous applied state until the
             // mutation is verified; recovery therefore rolls back to it.
             if let Err(error) = self.journal.write(&guard.record) {
@@ -914,6 +914,7 @@ impl Inner {
         let mut mutations: Vec<VerifiedMutation> = Vec::with_capacity(live.len());
         for index in 0..live.len() {
             let expected = applieds[index].clone();
+            live[index].lock().state = LiveState::Prepared;
             match self.mutate_and_verify(&olds[index].identity, &expected, plan, UPDATE_POINTS) {
                 Ok(mutation) => mutations.push(mutation),
                 Err(failure) => {
@@ -989,7 +990,8 @@ impl Inner {
         Ok(())
     }
 
-    /// Publishes a known verified state or an unmutated journal intent.
+    /// Publishes a verified state or intent after compensation has resolved the
+    /// native outcome. A Prepared payload here carries no outstanding mutation.
     pub(crate) fn persist_live(
         &self,
         live: &mut LiveRecord,
@@ -998,7 +1000,7 @@ impl Inner {
         let next = if candidate.phase == Phase::Applied {
             LiveState::Committed
         } else {
-            LiveState::Prepared
+            LiveState::Unmutated
         };
         match self.journal.write(&candidate) {
             Ok(()) => {
@@ -1031,7 +1033,7 @@ impl Inner {
             return Err(error);
         }
         live.record = candidate;
-        live.state = LiveState::Prepared;
+        live.state = LiveState::Unmutated;
         Ok(())
     }
 
@@ -1074,7 +1076,7 @@ impl Inner {
             live.state = *next.clone();
         }
         match live.state.clone() {
-            LiveState::Committed => Ok(()),
+            LiveState::Committed | LiveState::Unmutated => Ok(()),
             LiveState::Prepared => Err(Error::ExternalModification {
                 resource: live.record.resource.clone(),
                 detail: "prepared intent has no verified applied mutation".to_string(),

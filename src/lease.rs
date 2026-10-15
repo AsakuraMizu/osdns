@@ -25,7 +25,11 @@ pub(crate) struct LiveRecord {
 pub(crate) enum LiveState {
     /// Applied publication completed durably.
     Committed,
-    /// Durable intent without a verified active overlay.
+    /// Durable intent with no outstanding native mutation. Enforce may replace
+    /// it with a new durable intent without claiming ownership of current state.
+    Unmutated,
+    /// A native attempt started without a verified active overlay. This is
+    /// conservative until its outcome or ownership is established.
     Prepared,
     /// Desired state was verified; Applied publication remains outstanding.
     Verified(crate::platform::VerifiedMutation),

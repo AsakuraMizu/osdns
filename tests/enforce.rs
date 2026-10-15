@@ -44,6 +44,243 @@ fn wait_until(predicate: impl Fn() -> bool) {
 }
 
 #[rstest::rstest]
+#[case(1)]
+#[case(3)]
+fn rejected_overlay_rebases_once_external_state_stabilizes(
+    #[case] rejections: usize,
+    #[values("none", "rejected", "ambiguous")] publication_failure: &str,
+) {
+    let fixture = enforce_manager("enforce-rejected-retry");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.manager.suspend_enforce_background();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    let mut external = state_with("9.9.9.9");
+    for attempt in 0..rejections {
+        external = state_with(if attempt % 2 == 0 {
+            "8.8.8.8"
+        } else {
+            "4.4.4.4"
+        });
+        let generation = fixture.fake.generation(IFACE1).unwrap().unwrap();
+        fixture
+            .fake
+            .inject_external_before_guarded(IFACE1, external.clone())
+            .unwrap();
+        assert_eq!(
+            fixture.manager.debug_reconcile(IFACE1).unwrap(),
+            DebugReconcile::Failed
+        );
+        assert_eq!(
+            fixture.fake.current_state(IFACE1).unwrap(),
+            Some(external.clone())
+        );
+        assert_eq!(
+            fixture.fake.generation(IFACE1).unwrap(),
+            Some(generation + 1),
+            "a rejected attempt must neither apply nor compensate"
+        );
+        assert_eq!(journal_record_json(&fixture.dir)["phase"], "Prepared");
+    }
+    let generation = fixture.fake.generation(IFACE1).unwrap();
+    if publication_failure != "none" {
+        if publication_failure == "ambiguous" {
+            fixture.manager.set_journal_fail_after_io(true);
+        } else {
+            fixture.manager.set_journal_fail_writes(true);
+        }
+        assert_eq!(
+            fixture.manager.debug_reconcile(IFACE1).unwrap(),
+            DebugReconcile::Failed
+        );
+        assert_eq!(fixture.fake.generation(IFACE1).unwrap(), generation);
+        fixture.manager.set_journal_fail_after_io(false);
+        fixture.manager.set_journal_fail_writes(true);
+        assert_eq!(
+            fixture.manager.debug_reconcile(IFACE1).unwrap(),
+            DebugReconcile::Failed
+        );
+        assert_eq!(fixture.fake.generation(IFACE1).unwrap(), generation);
+        assert_eq!(lease.pending_durability(), lease.resources());
+        fixture.manager.set_journal_fail_writes(false);
+    }
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::Rebased
+    );
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("1.1.1.1"))
+    );
+    assert!(lease.pending_durability().is_empty());
+    lease.restore().unwrap();
+    assert_eq!(fixture.fake.current_state(IFACE1).unwrap(), Some(external));
+    assert!(journal_files(&fixture.dir).is_empty());
+}
+
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+fn rejected_overlay_does_not_grant_ownership(#[case] crash: bool) {
+    let fixture = enforce_manager("enforce-rejected-ownership");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.manager.suspend_enforce_background();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    let external = state_with(if crash { "8.8.8.8" } else { "1.1.1.1" });
+    fixture
+        .fake
+        .inject_external_before_guarded(IFACE1, external.clone())
+        .unwrap();
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::Failed
+    );
+    let generation = fixture.fake.generation(IFACE1).unwrap();
+    if crash {
+        lease.debug_release_locks_keep_journal();
+        assert!(matches!(
+            &fixture.manager.recover_stale().unwrap()[..],
+            [RecoveryOutcome::ExternalConflict { .. }]
+        ));
+        fixture
+            .manager
+            .abandon_journal(&resource_id(IFACE1))
+            .unwrap();
+    } else {
+        assert_eq!(
+            fixture.manager.debug_reconcile(IFACE1).unwrap(),
+            DebugReconcile::Deferred
+        );
+        let failure = lease.restore().unwrap_err();
+        assert!(failure.error.is_external_modification());
+        failure.lease.abandon().unwrap();
+    }
+    assert_eq!(fixture.fake.generation(IFACE1).unwrap(), generation);
+    assert_eq!(fixture.fake.current_state(IFACE1).unwrap(), Some(external));
+    assert!(journal_files(&fixture.dir).is_empty());
+}
+
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+fn compensated_overlay_intent_can_be_superseded(#[case] deferred_compensation: bool) {
+    use osdns::testing::FakeOp;
+    let fixture = enforce_manager("enforce-compensated-retry");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.manager.suspend_enforce_background();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    fixture.fake.inject_partial_apply_failure(1);
+    if deferred_compensation {
+        fixture
+            .fake
+            .inject_backend_failure(FakeOp::Restore, 1, "compensation unavailable");
+    }
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::Failed
+    );
+    if deferred_compensation {
+        // Compensation succeeds, but its journal publication must be repaired
+        // before the resolved intent can be replaced by another transaction.
+        fixture.manager.set_journal_fail_writes(true);
+        assert_eq!(
+            fixture.manager.debug_reconcile(IFACE1).unwrap(),
+            DebugReconcile::Failed
+        );
+    }
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
+    );
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("8.8.8.8"))
+        .unwrap();
+    fixture.manager.set_journal_fail_writes(false);
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::Rebased
+    );
+    lease.restore().unwrap();
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("8.8.8.8"))
+    );
+    assert!(journal_files(&fixture.dir).is_empty());
+}
+
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+fn indeterminate_overlay_cannot_be_superseded(#[case] produced_evidence: bool) {
+    use osdns::testing::FakeOp;
+    let fixture = enforce_manager("enforce-indeterminate-blocked");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.manager.suspend_enforce_background();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    if produced_evidence {
+        fixture.fake.inject_partial_apply_failure(1);
+        fixture
+            .fake
+            .inject_backend_failure(FakeOp::Restore, 1, "compensation unavailable");
+    } else {
+        // This seam changes native state before the backend returns an
+        // indeterminate result with no produced evidence.
+        fixture
+            .fake
+            .inject_external_before_nth_guarded(0, IFACE1, state_with("8.8.8.8"))
+            .unwrap();
+        fixture
+            .fake
+            .inject_backend_failure(FakeOp::Apply, 1, "outcome unknown");
+    }
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::Failed
+    );
+    if produced_evidence {
+        fixture
+            .fake
+            .external_change(IFACE1, state_with("8.8.8.8"))
+            .unwrap();
+    }
+    let generation = fixture.fake.generation(IFACE1).unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            fixture.manager.debug_reconcile(IFACE1).unwrap(),
+            if produced_evidence {
+                DebugReconcile::Deferred
+            } else {
+                DebugReconcile::Failed
+            }
+        );
+        assert_eq!(fixture.fake.generation(IFACE1).unwrap(), generation);
+        assert_eq!(lease.pending_durability(), lease.resources());
+    }
+    lease.debug_release_locks_keep_journal();
+    assert!(matches!(
+        &fixture.manager.recover_stale().unwrap()[..],
+        [RecoveryOutcome::ExternalConflict { .. }]
+    ));
+    assert_eq!(fixture.fake.generation(IFACE1).unwrap(), generation);
+    fixture
+        .manager
+        .abandon_journal(&resource_id(IFACE1))
+        .unwrap();
+}
+
+#[rstest::rstest]
 #[case(false)]
 #[case(true)]
 fn unresolved_overlay_blocks_new_mutation_until_compensated(

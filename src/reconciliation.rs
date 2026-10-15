@@ -44,7 +44,6 @@ use crate::fault::TxPoint;
 use crate::journal::Phase;
 use crate::lease::{LiveRecord, LiveState};
 use crate::manager::{Inner, RECONCILE_POINTS};
-use crate::normalize::NormalizedConfig;
 use crate::ownership::ResourceId;
 use crate::platform::PlatformSnapshot;
 use crate::platform::ResourceStatus;
@@ -391,24 +390,24 @@ impl Inner {
             if self.backend.matches_desired(&second, &guard.record.desired) {
                 return ReconcileOutcome::StillOurs;
             }
-            let desired = guard.record.desired.clone();
+            let before = guard.record.before.clone();
             drop(guard);
-            return self.apply_overlay(entry, &second, &desired);
+            return self.apply_overlay(entry, &second, &before);
         }
 
-        if let Some(applied) = guard.applied()
-            && self.backend.matches_desired(&second, &guard.record.desired)
-            && !self.backend.owns_current(applied, &second)
+        if self.backend.matches_desired(&second, &guard.record.desired)
+            && guard
+                .applied()
+                .is_none_or(|applied| !self.backend.owns_current(applied, &second))
         {
             reconciler.defer(resource, IDENTITY_RETRY, false);
             return ReconcileOutcome::Deferred;
         }
 
         if self.backend.equivalent(&second, &guard.record.before) {
-            let desired = guard.record.desired.clone();
-            let expected = second.clone();
+            let before = guard.record.before.clone();
             drop(guard);
-            return self.apply_overlay(entry, &expected, &desired);
+            return self.apply_overlay(entry, &second, &before);
         }
 
         drop(guard);
@@ -421,23 +420,22 @@ impl Inner {
             );
             return ReconcileOutcome::Deferred;
         }
-        self.rebase_transaction(entry, &second)
+        self.apply_overlay(entry, &second, &second)
     }
 
     fn apply_overlay(
         &self,
         entry: &Arc<Mutex<LiveRecord>>,
         expected: &PlatformSnapshot,
-        desired: &NormalizedConfig,
+        before: &PlatformSnapshot,
     ) -> ReconcileOutcome {
         let resume = {
             let mut live = entry.lock();
             let mut candidate = live.record.clone();
+            candidate.before = before.clone();
             candidate.phase = Phase::Prepared;
             candidate.applied = None;
-            if !matches!(live.state, LiveState::Prepared)
-                && self.prepare_live(&mut live, candidate.clone()).is_err()
-            {
+            if self.prepare_live(&mut live, candidate.clone()).is_err() {
                 return ReconcileOutcome::Failed;
             }
             candidate
@@ -445,8 +443,15 @@ impl Inner {
         if self.fire(TxPoint::AfterPrepared).is_err() {
             return ReconcileOutcome::Deferred;
         }
-        let identity = entry.lock().record.identity.clone();
-        match self.mutate_and_verify(&identity, expected, desired, RECONCILE_POINTS) {
+        // Until the backend reports its outcome, no other path may interpret
+        // the durable intent as a demonstrably unmutated attempt.
+        entry.lock().state = LiveState::Prepared;
+        match self.mutate_and_verify(
+            &resume.identity,
+            expected,
+            &resume.desired,
+            RECONCILE_POINTS,
+        ) {
             Ok(mutation) => {
                 if self.commit_verified(&mut entry.lock(), mutation).is_err() {
                     ReconcileOutcome::Failed
@@ -456,36 +461,19 @@ impl Inner {
                 }
             }
             Err(failure) => {
-                if let crate::manager::MutationResidue::Pending(pending) = failure.residue {
+                entry.lock().state = match failure.residue {
+                    crate::manager::MutationResidue::Unchanged
+                    | crate::manager::MutationResidue::Restored(_) => LiveState::Unmutated,
                     // Keep residue volatile until resolution or teardown. A crash
                     // before evidence publication must remain fail-closed.
-                    entry.lock().state = LiveState::Compensating {
+                    crate::manager::MutationResidue::Pending(pending) => LiveState::Compensating {
                         pending,
                         resume: Box::new(resume),
-                    };
-                }
+                    },
+                };
                 ReconcileOutcome::Failed
             }
         }
-    }
-
-    fn rebase_transaction(
-        &self,
-        entry: &Arc<Mutex<LiveRecord>>,
-        external_base: &PlatformSnapshot,
-    ) -> ReconcileOutcome {
-        {
-            let mut live = entry.lock();
-            let mut candidate = live.record.clone();
-            candidate.before = external_base.clone();
-            candidate.applied = None;
-            candidate.phase = Phase::Prepared;
-            if self.prepare_live(&mut live, candidate).is_err() {
-                return ReconcileOutcome::Failed;
-            }
-        }
-        let desired = entry.lock().record.desired.clone();
-        self.apply_overlay(entry, external_base, &desired)
     }
 }
 
