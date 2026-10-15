@@ -12,7 +12,7 @@ use crate::error::{ConflictReason, Error, Result};
 use crate::fault::{CrashSignal, FaultAction, FaultHook, TxPoint};
 use crate::interface::InterfaceInfo;
 use crate::journal::{JournalRecord, JournalStore, Phase};
-use crate::lease::{Lease, LiveRecord};
+use crate::lease::{Lease, LiveRecord, LiveState};
 use crate::normalize::NormalizedConfig;
 use crate::ownership::{ResourceId, ResourceLockManager};
 use crate::platform::{
@@ -379,24 +379,28 @@ const UPDATE_POINTS: MutatePoints = MutatePoints {
     suppress_events: true,
 };
 
-pub(crate) struct MutationResidue {
-    pub(crate) leftover: Option<OwnershipProof>,
-    restored: Option<PlatformSnapshot>,
+#[derive(Clone)]
+pub(crate) struct PendingRollback {
+    /// Backend-issued mutation evidence, or the previously committed snapshot
+    /// interpreted under the backend's declared ownership contract.
+    pub(crate) evidence: Option<PlatformSnapshot>,
+    pub(crate) target: PlatformSnapshot,
 }
 
-impl MutationResidue {
-    pub(crate) fn new() -> Self {
-        Self {
-            leftover: None,
-            restored: None,
-        }
-    }
+pub(crate) enum MutationResidue {
+    Unchanged,
+    Restored(Option<PlatformSnapshot>),
+    Pending(PendingRollback),
+}
+
+pub(crate) struct MutationFailure {
+    pub(crate) error: Error,
+    pub(crate) residue: MutationResidue,
 }
 
 pub(crate) struct PreparedLease {
     lease_id: Uuid,
-    records: Vec<JournalRecord>,
-    verified: Vec<Option<OwnershipProof>>,
+    records: Vec<LiveRecord>,
     was_noop: bool,
 }
 
@@ -446,42 +450,33 @@ impl Inner {
         identity: &ResourceIdentity,
         expected_current: &PlatformSnapshot,
         plan: &NormalizedConfig,
-        rollback_to: Option<&PlatformSnapshot>,
         points: MutatePoints,
-        residue: &mut MutationResidue,
-    ) -> Result<VerifiedMutation> {
+    ) -> std::result::Result<VerifiedMutation, Box<MutationFailure>> {
         let resource = &identity.resource;
-        residue.leftover = None;
-        residue.restored = None;
         match self.backend.apply_bound(identity, expected_current, plan) {
-            MutationAttempt::Rejected { error } => Err(error),
-            MutationAttempt::Indeterminate { error, produced } => {
-                match self.rollback_proven(resource, identity, produced.as_ref(), rollback_to) {
-                    Some(identity) => residue.restored = identity,
-                    None => residue.leftover = produced.map(OwnershipProof::issued),
-                }
-                Err(error)
-            }
+            MutationAttempt::Rejected { error } => Err(Box::new(MutationFailure {
+                error,
+                residue: MutationResidue::Unchanged,
+            })),
+            MutationAttempt::Indeterminate { error, produced } => Err(Box::new(MutationFailure {
+                error,
+                residue: self.rollback_proven(identity, produced, expected_current),
+            })),
             MutationAttempt::Performed { produced } => {
-                let fail = |this: &Self,
-                            residue: &mut MutationResidue,
-                            produced: Option<PlatformSnapshot>,
-                            error: Error| {
-                    match this.rollback_proven(resource, identity, produced.as_ref(), rollback_to) {
-                        Some(identity) => residue.restored = identity,
-                        None => residue.leftover = produced.map(OwnershipProof::issued),
-                    }
-                    Err(error)
+                let fail = |this: &Self, produced: Option<PlatformSnapshot>, error: Error| {
+                    Err(Box::new(MutationFailure {
+                        error,
+                        residue: this.rollback_proven(identity, produced, expected_current),
+                    }))
                 };
                 if let Err(error) = self.fire(points.apply) {
-                    return fail(self, residue, produced, error);
+                    return fail(self, produced, error);
                 }
                 match self.backend.resource_status(identity) {
                     Ok(ResourceStatus::Same) => {}
                     Ok(status) => {
                         return fail(
                             self,
-                            residue,
                             produced,
                             Error::ResourceIdentity {
                                 backend: self.backend.kind(),
@@ -492,17 +487,16 @@ impl Inner {
                             },
                         );
                     }
-                    Err(error) => return fail(self, residue, produced, error),
+                    Err(error) => return fail(self, produced, error),
                 }
                 match self.backend.readback(resource) {
                     Ok(actual) => {
                         if let Err(error) = self.fire(points.readback) {
-                            return fail(self, residue, produced, error);
+                            return fail(self, produced, error);
                         }
                         if !self.backend.matches_desired(&actual, plan) {
                             return fail(
                                 self,
-                                residue,
                                 produced,
                                 Error::VerificationFailed {
                                     resource: resource.clone(),
@@ -516,7 +510,6 @@ impl Inner {
                             Ok(status) => {
                                 return fail(
                                     self,
-                                    residue,
                                     produced,
                                     Error::ResourceIdentity {
                                         backend: self.backend.kind(),
@@ -527,17 +520,16 @@ impl Inner {
                                     },
                                 );
                             }
-                            Err(error) => return fail(self, residue, produced, error),
+                            Err(error) => return fail(self, produced, error),
                         }
                         if let Err(error) = self.fire(points.verify) {
-                            return fail(self, residue, produced, error);
+                            return fail(self, produced, error);
                         }
                         match self.backend.ownership_identity() {
                             OwnershipIdentity::Durable => {
                                 let Some(produced) = produced else {
                                     return fail(
                                         self,
-                                        residue,
                                         None,
                                         Error::VerificationFailed {
                                             resource: resource.clone(),
@@ -549,7 +541,6 @@ impl Inner {
                                 if !self.backend.proves_current(&produced, &actual) {
                                     return fail(
                                         self,
-                                        residue,
                                         Some(produced),
                                         Error::ExternalModification {
                                             resource: resource.clone(),
@@ -577,70 +568,104 @@ impl Inner {
                             }
                         }
                     }
-                    Err(error) => fail(self, residue, produced, error),
+                    Err(error) => fail(self, produced, error),
                 }
             }
         }
     }
 
-    fn restore_if_current(
+    /// Compensation can issue a new identity even when it fails or read-back
+    /// fails. Retain that identity rather than retrying with the superseded one.
+    fn rollback_proven(
         &self,
         identity: &ResourceIdentity,
-        expected: &PlatformSnapshot,
+        proof: Option<PlatformSnapshot>,
         target: &PlatformSnapshot,
-    ) -> Result<Option<PlatformSnapshot>> {
-        match self.backend.restore_bound(identity, expected, target) {
-            MutationAttempt::Performed { produced } => Ok(produced),
-            MutationAttempt::Rejected { error } | MutationAttempt::Indeterminate { error, .. } => {
-                Err(error)
-            }
+    ) -> MutationResidue {
+        let mut pending = PendingRollback {
+            evidence: proof,
+            target: target.clone(),
+        };
+        match self.compensate(identity, &mut pending, None) {
+            Ok(restored) => MutationResidue::Restored(restored),
+            Err(_) => MutationResidue::Pending(pending),
         }
     }
 
-    /// Rolls back only when `proof` is backend-issued identity of a state we
-    /// created. A post-failure read is not proof. `Some(identity)` is the
-    /// snapshot that now names the restored state when the backend issued
-    /// one.
-    #[allow(unused_variables)]
-    fn rollback_proven(
+    fn compensate(
         &self,
-        resource: &ResourceId,
         identity: &ResourceIdentity,
-        proof: Option<&PlatformSnapshot>,
-        target: Option<&PlatformSnapshot>,
-    ) -> Option<Option<PlatformSnapshot>> {
-        let (Some(proof), Some(target)) = (proof, target) else {
-            return None;
-        };
-        if self.backend.equivalent(proof, target) {
-            return Some(Some(proof.clone()));
+        pending: &mut PendingRollback,
+        after_restore: Option<TxPoint>,
+    ) -> Result<Option<PlatformSnapshot>> {
+        if self.backend.resource_status(identity)? != ResourceStatus::Same {
+            return Err(Error::ResourceIdentity {
+                backend: self.backend.kind(),
+                resource: identity.resource.clone(),
+                message: "cannot prove the compensation target incarnation".to_string(),
+            });
         }
-        let produced = match self.restore_if_current(identity, proof, target) {
-            Ok(produced) => produced,
-            Err(error) => {
-                osdns_warn!(
-                    resource = %resource,
-                    error = %error,
-                    "rollback could not restore the previous state; the journal record was kept for later recovery"
-                );
-                return None;
-            }
-        };
-        match self.backend.readback(resource) {
-            Ok(now) if self.backend.equivalent(&now, target) => {
-                self.suppressions.record(&now);
-                Some(produced)
-            }
-            Ok(_) => None,
-            Err(error) => {
-                osdns_warn!(
-                    resource = %resource,
-                    error = %error,
-                    "rollback could not read back the restored state; the journal record was kept for later recovery"
-                );
-                None
-            }
+        let current = self.backend.readback(&identity.resource)?;
+        // A target match needs no write and grants no new ownership identity.
+        if self.backend.equivalent(&current, &pending.target) {
+            let proof = pending
+                .evidence
+                .as_ref()
+                .filter(|proof| self.backend.owns_current(proof, &current));
+            return Ok(proof.cloned().or_else(|| {
+                self.backend
+                    .owns_current(&pending.target, &current)
+                    .then(|| pending.target.clone())
+            }));
         }
+        let proof = pending
+            .evidence
+            .as_ref()
+            .ok_or_else(|| Error::IndeterminateMutation {
+                backend: self.backend.kind(),
+                message: "compensation has no backend-issued ownership evidence".to_string(),
+            })?;
+        if !self.backend.owns_current(proof, &current) {
+            return Err(Error::ExternalModification {
+                resource: identity.resource.clone(),
+                detail: "pending compensation evidence no longer names current state".to_string(),
+            });
+        }
+        match self.backend.restore_bound(identity, proof, &pending.target) {
+            MutationAttempt::Performed { produced } => {
+                pending.evidence = produced;
+            }
+            MutationAttempt::Indeterminate { error, produced } => {
+                if let Some(produced) = produced {
+                    pending.evidence = Some(produced);
+                }
+                return Err(error);
+            }
+            MutationAttempt::Rejected { error } => return Err(error),
+        }
+        if let Some(point) = after_restore {
+            self.fire(point)?;
+        }
+        let now = self.backend.readback(&identity.resource)?;
+        if self.backend.resource_status(identity)? != ResourceStatus::Same
+            || !self.backend.equivalent(&now, &pending.target)
+        {
+            return Err(Error::VerificationFailed {
+                resource: identity.resource.clone(),
+                detail: "compensation failed read-back verification".to_string(),
+            });
+        }
+        self.suppressions.record(&now);
+        Ok(pending
+            .evidence
+            .as_ref()
+            .filter(|proof| self.backend.owns_current(proof, &now))
+            .cloned()
+            .or_else(|| {
+                (pending.evidence.is_none()
+                    && self.backend.ownership_identity() == OwnershipIdentity::BestEffort)
+                    .then_some(now)
+            }))
     }
 
     fn persist_unmutated(&self, records: &[JournalRecord]) -> Result<()> {
@@ -680,7 +705,7 @@ impl Inner {
         let was_noop = befores
             .iter()
             .all(|before| self.backend.matches_desired(before, plan));
-        let mut records: Vec<JournalRecord> = resources
+        let records: Vec<JournalRecord> = resources
             .into_iter()
             .zip(befores)
             .zip(identities)
@@ -703,11 +728,15 @@ impl Inner {
         self.persist_unmutated(&records)?;
         if was_noop {
             self.fire(TxPoint::AfterApplied)?;
-            let n = records.len();
             return Ok(PreparedLease {
                 lease_id,
-                records,
-                verified: vec![None; n],
+                records: records
+                    .into_iter()
+                    .map(|record| LiveRecord {
+                        record,
+                        state: LiveState::Committed,
+                    })
+                    .collect(),
                 was_noop,
             });
         }
@@ -715,62 +744,59 @@ impl Inner {
         let mut mutations: Vec<VerifiedMutation> = Vec::new();
         for index in 0..records.len() {
             let expected = records[index].before.clone();
-            let mut residue = MutationResidue::new();
-            match self.mutate_and_verify(
-                &records[index].identity,
-                &expected,
-                plan,
-                Some(&records[index].before),
-                INITIAL_POINTS,
-                &mut residue,
-            ) {
+            match self.mutate_and_verify(&records[index].identity, &expected, plan, INITIAL_POINTS)
+            {
                 Ok(mutation) => mutations.push(mutation),
-                Err(error) => {
+                Err(failure) => {
+                    let MutationFailure { error, residue } = *failure;
                     let mut cleanup = Vec::new();
                     for (record, mutation) in records[..index].iter().zip(&mutations) {
-                        if self
-                            .rollback_proven(
-                                &record.resource,
-                                &record.identity,
-                                Some(&mutation.persist()),
-                                Some(&record.before),
-                            )
-                            .is_some()
-                        {
-                            if let Err(error) =
-                                self.journal.remove(&record.lease_id, &record.resource)
-                            {
-                                cleanup.push(error);
+                        match self.rollback_proven(
+                            &record.identity,
+                            Some(mutation.persist()),
+                            &record.before,
+                        ) {
+                            MutationResidue::Restored(_) => {
+                                if let Err(error) =
+                                    self.journal.remove(&record.lease_id, &record.resource)
+                                {
+                                    cleanup.push(error);
+                                }
                             }
-                        } else {
-                            cleanup.push(Error::IndeterminateMutation {
-                                backend: self.backend.kind(),
-                                message: format!(
-                                    "apply rollback could not restore {}",
-                                    record.resource
-                                ),
-                            });
-                            let mut retained = record.clone();
-                            retained.phase = Phase::Applied;
-                            retained.applied = Some(mutation.persist());
+                            MutationResidue::Pending(pending) => {
+                                let mut retained = record.clone();
+                                retained.applied = pending.evidence;
+                                if let Err(error) = self.journal.write(&retained) {
+                                    cleanup.push(error);
+                                }
+                                cleanup.push(Error::IndeterminateMutation {
+                                    backend: self.backend.kind(),
+                                    message: format!(
+                                        "apply rollback could not restore {}",
+                                        record.resource
+                                    ),
+                                });
+                            }
+                            MutationResidue::Unchanged => unreachable!(),
+                        }
+                    }
+                    let failed = &records[index];
+                    match residue {
+                        MutationResidue::Pending(pending) => {
+                            let mut retained = failed.clone();
+                            retained.applied = pending.evidence;
                             if let Err(error) = self.journal.write(&retained) {
                                 cleanup.push(error);
                             }
                         }
-                    }
-                    let failed = &records[index];
-                    if residue.leftover.is_none()
-                        && let Ok(now) = self.backend.readback(&failed.resource)
-                        && self.backend.equivalent(&now, &failed.before)
-                        && let Err(error) = self.journal.remove(&failed.lease_id, &failed.resource)
-                    {
-                        cleanup.push(error);
-                    }
-                    if let Some(proof) = &residue.leftover {
-                        let mut retained = failed.clone();
-                        retained.applied = Some(proof.as_snapshot().clone());
-                        if let Err(error) = self.journal.write(&retained) {
-                            cleanup.push(error);
+                        MutationResidue::Restored(_) | MutationResidue::Unchanged => {
+                            if let Ok(now) = self.backend.readback(&failed.resource)
+                                && self.backend.equivalent(&now, &failed.before)
+                                && let Err(error) =
+                                    self.journal.remove(&failed.lease_id, &failed.resource)
+                            {
+                                cleanup.push(error);
+                            }
                         }
                     }
                     for record in &records[index + 1..] {
@@ -783,20 +809,18 @@ impl Inner {
                 }
             }
         }
-        let mut verified = vec![None; records.len()];
+        let mut live: Vec<LiveRecord> = records
+            .into_iter()
+            .map(|record| LiveRecord {
+                record,
+                state: LiveState::Prepared,
+            })
+            .collect();
         let mut all_written = true;
-        for (index, record) in records.iter_mut().enumerate() {
-            record.phase = Phase::Applied;
-            record.applied = Some(mutations[index].persist());
-            if let Err(_error) = self.journal.write(record) {
-                osdns_warn!(resource = %record.resource, error = %_error,
-                    "verified mutation has only live ownership proof until journal finalization succeeds");
-                verified[index] = mutations[index]
-                    .proof
-                    .clone()
-                    .or_else(|| record.applied.take().map(OwnershipProof::issued));
-                record.applied = None;
-                record.phase = Phase::Prepared;
+        for (record, mutation) in live.iter_mut().zip(mutations) {
+            if let Err(_error) = self.commit_verified(record, mutation) {
+                osdns_warn!(resource = %record.record.resource, error = %_error,
+                    "verified mutation remains pending until journal finalization succeeds");
                 all_written = false;
             }
         }
@@ -805,8 +829,7 @@ impl Inner {
         }
         Ok(PreparedLease {
             lease_id,
-            records,
-            verified,
+            records: live,
             was_noop: false,
         })
     }
@@ -832,8 +855,8 @@ impl Inner {
         let mut applieds: Vec<PlatformSnapshot> = Vec::with_capacity(live.len());
         for record in live {
             let mut guard = record.lock();
-            self.finalize_live(&mut guard, None)?;
-            let applied = guard.record.applied.clone().ok_or_else(|| {
+            self.resolve_live(&mut guard, None)?;
+            let applied = guard.applied().cloned().ok_or_else(|| {
                 Error::ExternalModification {
                     resource: guard.record.resource.clone(),
                     detail: "the lease record carries no verified applied state; refusing to overwrite indeterminate state"
@@ -867,6 +890,7 @@ impl Inner {
             let mut guard = record.lock();
             guard.record.desired = plan.clone();
             guard.record.phase = Phase::Prepared;
+            guard.state = LiveState::Prepared;
             // `applied` still carries the previous applied state until the
             // mutation is verified; recovery therefore rolls back to it.
             if let Err(error) = self.journal.write(&guard.record) {
@@ -887,71 +911,60 @@ impl Inner {
         // On failure every touched resource (including the failed one)
         // rolls back to its previous applied state; journals are then
         // restored to their pre-update form.
-        let mut mutations: Vec<Option<VerifiedMutation>> = vec![None; live.len()];
+        let mut mutations: Vec<VerifiedMutation> = Vec::with_capacity(live.len());
         for index in 0..live.len() {
             let expected = applieds[index].clone();
-            let mut residue = MutationResidue::new();
-            match self.mutate_and_verify(
-                &olds[index].identity,
-                &expected,
-                plan,
-                Some(&applieds[index]),
-                UPDATE_POINTS,
-                &mut residue,
-            ) {
-                Ok(mutation) => mutations[index] = Some(mutation),
-                Err(error) => {
+            match self.mutate_and_verify(&olds[index].identity, &expected, plan, UPDATE_POINTS) {
+                Ok(mutation) => mutations.push(mutation),
+                Err(failure) => {
+                    let MutationFailure { error, residue } = *failure;
                     let mut cleanup = Vec::new();
-                    let mut restored_identity: Vec<Option<PlatformSnapshot>> =
-                        vec![None; live.len()];
+                    let mut residues: Vec<MutationResidue> = (0..live.len())
+                        .map(|_| MutationResidue::Unchanged)
+                        .collect();
                     for rollback_index in 0..index {
-                        if let Some(mutation) = &mutations[rollback_index] {
-                            match self.rollback_proven(
-                                &olds[rollback_index].resource,
-                                &olds[rollback_index].identity,
-                                Some(&mutation.persist()),
-                                Some(&applieds[rollback_index]),
-                            ) {
-                                Some(identity) => restored_identity[rollback_index] = identity,
-                                None => {
-                                    cleanup.push(Error::IndeterminateMutation {
-                                        backend: self.backend.kind(),
-                                        message: format!(
-                                            "update rollback could not restore {}",
-                                            olds[rollback_index].resource
-                                        ),
-                                    });
-                                    restored_identity[rollback_index] = Some(mutation.persist());
-                                }
-                            }
-                        }
+                        let mutation = &mutations[rollback_index];
+                        residues[rollback_index] = self.rollback_proven(
+                            &olds[rollback_index].identity,
+                            Some(mutation.persist()),
+                            &applieds[rollback_index],
+                        );
                     }
+                    residues[index] = residue;
                     self.fire(TxPoint::AfterUpdateVerify).ok();
-                    for (old_index, (old, live_record)) in olds.iter().zip(live.iter()).enumerate()
-                    {
+                    for ((old, live_record), residue) in olds.iter().zip(live).zip(residues) {
                         let mut guard = live_record.lock();
-                        if old_index == index && residue.leftover.is_some() {
-                            guard.verified = residue.leftover.take();
-                            guard.record.phase = Phase::Prepared;
-                            guard.record.applied = guard
-                                .verified
-                                .as_ref()
-                                .map(|proof| proof.as_snapshot().clone());
-                            guard.record.desired = old.desired.clone();
-                            if let Err(error) = self.journal.write(&guard.record) {
-                                cleanup.push(error);
-                            }
-                        } else {
-                            let mut candidate = old.clone();
-                            if old_index == index {
-                                if let Some(identity) = residue.restored.take() {
-                                    candidate.applied = Some(identity);
+                        match residue {
+                            MutationResidue::Pending(pending) => {
+                                if let Err(error) =
+                                    self.retain_compensation(&mut guard, pending, old.clone())
+                                {
+                                    cleanup.push(error);
                                 }
-                            } else if let Some(identity) = restored_identity[old_index].take() {
-                                candidate.applied = Some(identity);
+                                cleanup.push(Error::IndeterminateMutation {
+                                    backend: self.backend.kind(),
+                                    message: format!(
+                                        "update rollback could not restore {}",
+                                        old.resource
+                                    ),
+                                });
                             }
-                            if let Err(error) = self.persist_live(&mut guard, candidate) {
-                                cleanup.push(error);
+                            MutationResidue::Restored(identity) => {
+                                let mut candidate = old.clone();
+                                // Without new evidence, the old identity cannot authorize
+                                // another mutation after a restore changed its generation.
+                                candidate.applied = identity;
+                                if candidate.applied.is_none() {
+                                    candidate.phase = Phase::Prepared;
+                                }
+                                if let Err(error) = self.persist_live(&mut guard, candidate) {
+                                    cleanup.push(error);
+                                }
+                            }
+                            MutationResidue::Unchanged => {
+                                if let Err(error) = self.persist_live(&mut guard, old.clone()) {
+                                    cleanup.push(error);
+                                }
                             }
                         }
                     }
@@ -962,11 +975,8 @@ impl Inner {
         let mut write_error = None;
         for (index, record) in live.iter().enumerate() {
             let mut guard = record.lock();
-            let mutation = mutations[index].as_ref().expect("mutation succeeded");
-            let mut candidate = guard.record.clone();
-            candidate.phase = Phase::Applied;
-            candidate.applied = Some(mutation.persist());
-            if let Err(error) = self.persist_live(&mut guard, candidate)
+            let mutation = &mutations[index];
+            if let Err(error) = self.commit_verified(&mut guard, mutation.clone())
                 && write_error.is_none()
             {
                 write_error = Some(error);
@@ -979,61 +989,146 @@ impl Inner {
         Ok(())
     }
 
-    fn persist_live(&self, live: &mut LiveRecord, mut candidate: JournalRecord) -> Result<()> {
+    /// Publishes a known verified state or an unmutated journal intent.
+    pub(crate) fn persist_live(
+        &self,
+        live: &mut LiveRecord,
+        candidate: JournalRecord,
+    ) -> Result<()> {
+        let next = if candidate.phase == Phase::Applied {
+            LiveState::Committed
+        } else {
+            LiveState::Prepared
+        };
         match self.journal.write(&candidate) {
             Ok(()) => {
                 live.record = candidate;
-                live.verified = None;
+                live.state = next;
                 Ok(())
             }
             Err(error) => {
-                live.verified = candidate.applied.take().map(OwnershipProof::issued);
-                candidate.phase = Phase::Prepared;
                 live.record = candidate;
+                live.state = LiveState::Repair(Box::new(next));
                 Err(error)
             }
         }
     }
 
-    pub(crate) fn finalize_live(
+    /// Every new native attempt first replaces the previous Applied record
+    /// with durable Prepared intent. Failed publication restores the old intent
+    /// or blocks mutation behind an explicit journal repair.
+    pub(crate) fn prepare_live(
+        &self,
+        live: &mut LiveRecord,
+        candidate: JournalRecord,
+    ) -> Result<()> {
+        let old = live.record.clone();
+        let state = live.state.clone();
+        if let Err(error) = self.journal.write(&candidate) {
+            if self.journal.write(&old).is_err() {
+                live.state = LiveState::Repair(Box::new(state));
+            }
+            return Err(error);
+        }
+        live.record = candidate;
+        live.state = LiveState::Prepared;
+        Ok(())
+    }
+
+    pub(crate) fn commit_verified(
+        &self,
+        live: &mut LiveRecord,
+        mutation: VerifiedMutation,
+    ) -> Result<()> {
+        live.state = LiveState::Verified(mutation);
+        self.resolve_live(live, None)
+    }
+
+    fn retain_compensation(
+        &self,
+        live: &mut LiveRecord,
+        pending: PendingRollback,
+        resume: JournalRecord,
+    ) -> Result<()> {
+        live.record.phase = Phase::Prepared;
+        live.record.applied = pending.evidence.clone();
+        live.record.desired = resume.desired.clone();
+        live.state = LiveState::Compensating {
+            pending,
+            resume: Box::new(resume),
+        };
+        if let Err(error) = self.journal.write(&live.record) {
+            live.state = LiveState::Repair(Box::new(live.state.clone()));
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resolve_live(
         &self,
         live: &mut LiveRecord,
         current: Option<&PlatformSnapshot>,
     ) -> Result<()> {
-        if live.journal_pending {
+        if let LiveState::Repair(next) = &live.state {
             self.journal.write(&live.record)?;
-            live.journal_pending = false;
+            live.state = *next.clone();
         }
-        if live.record.phase == Phase::Applied && live.record.applied.is_some() {
-            live.verified = None;
-            return Ok(());
-        }
-        let Some(proof) = live.verified.clone() else {
-            return Err(Error::ExternalModification {
+        match live.state.clone() {
+            LiveState::Committed => Ok(()),
+            LiveState::Prepared => Err(Error::ExternalModification {
                 resource: live.record.resource.clone(),
-                detail: "the lease record carries no verified applied state; refusing to overwrite indeterminate state"
-                    .to_string(),
-            });
-        };
-        let owned;
-        let current = match current {
-            Some(current) => current,
-            None => {
-                owned = self.backend.readback(&live.record.resource)?;
-                &owned
+                detail: "prepared intent has no verified applied mutation".to_string(),
+            }),
+            LiveState::Verified(mutation) => {
+                let owned;
+                let current = match current {
+                    Some(current) => current,
+                    None => {
+                        owned = self.backend.readback(&live.record.resource)?;
+                        &owned
+                    }
+                };
+                if self.backend.resource_status(&live.record.identity)? != ResourceStatus::Same
+                    || !self.backend.owns_current(&mutation.persist(), current)
+                {
+                    return Err(Error::ExternalModification {
+                        resource: live.record.resource.clone(),
+                        detail: "verified mutation no longer names current native state"
+                            .to_string(),
+                    });
+                }
+                let mut candidate = live.record.clone();
+                candidate.phase = Phase::Applied;
+                candidate.applied = Some(mutation.persist());
+                self.journal.write(&candidate)?;
+                live.record = candidate;
+                live.state = LiveState::Committed;
+                Ok(())
             }
-        };
-        if !self.backend.owns_current(proof.as_snapshot(), current) {
-            return Err(Error::ExternalModification {
-                resource: live.record.resource.clone(),
-                detail: "the retained mutation proof no longer names the current state".to_string(),
-            });
+            LiveState::Compensating {
+                mut pending,
+                mut resume,
+            } => {
+                match self.compensate(&live.record.identity, &mut pending, None) {
+                    Ok(identity) => {
+                        if resume.phase == Phase::Applied {
+                            resume.applied = identity;
+                            if resume.applied.is_none() {
+                                resume.phase = Phase::Prepared;
+                            }
+                        }
+                        self.persist_live(live, *resume)
+                    }
+                    Err(error) => {
+                        // A restoration attempt may have issued a newer identity.
+                        // Publish it conservatively as Prepared recovery evidence.
+                        let _ = self.retain_compensation(live, pending, *resume);
+                        Err(error)
+                    }
+                }
+            }
+            LiveState::Repair(_) => unreachable!("journal repair is resolved first"),
         }
-        let mut candidate = live.record.clone();
-        candidate.applied = Some(proof.into_snapshot());
-        candidate.phase = Phase::Applied;
-        self.persist_live(live, candidate)?;
-        Ok(())
     }
 
     /// Restores one live-lease resource to its `before` snapshot, failing
@@ -1056,7 +1151,7 @@ impl Inner {
             }
             ResourceStatus::Same => {}
         }
-        let current = match self.backend.readback(resource) {
+        let mut current = match self.backend.readback(resource) {
             Ok(current) => current,
             Err(Error::ResourceGone { .. }) => {
                 self.journal.remove(&record.lease_id, resource)?;
@@ -1070,10 +1165,19 @@ impl Inner {
             self.fire(TxPoint::AfterRestoreJournal)?;
             return Ok(());
         }
-        self.finalize_live(live, Some(&current))?;
+        if !matches!(live.state, LiveState::Committed) {
+            self.resolve_live(live, Some(&current))?;
+            current = self.backend.readback(&live.record.resource)?;
+            if self.backend.equivalent(&current, &live.record.before) {
+                self.journal
+                    .remove(&live.record.lease_id, &live.record.resource)?;
+                self.fire(TxPoint::AfterRestoreJournal)?;
+                return Ok(());
+            }
+        }
         let record = &live.record;
         let resource = &record.resource;
-        let applied = record.applied.as_ref().ok_or_else(|| Error::ExternalModification {
+        let applied = live.applied().ok_or_else(|| Error::ExternalModification {
             resource: resource.clone(),
             detail: "the lease record carries no verified applied state; refusing to overwrite indeterminate state"
                 .to_string(),
@@ -1085,27 +1189,43 @@ impl Inner {
                     .to_string(),
             });
         }
-        self.restore_if_current(&record.identity, applied, &record.before)?;
-        self.fire(TxPoint::AfterRestoreRestore)?;
-        let now = self.backend.readback(resource)?;
-        if !self.backend.equivalent(&now, &record.before) {
-            return Err(Error::VerificationFailed {
-                resource: resource.clone(),
-                detail: "the restored state failed read-back verification".to_string(),
-            });
+        let mut pending = PendingRollback {
+            evidence: Some(applied.clone()),
+            target: record.before.clone(),
+        };
+        let mut resume = record.clone();
+        resume.phase = Phase::Prepared;
+        resume.applied = None;
+        // Record the operation before calling the backend. Errors and failed
+        // verification must keep the latest restoration identity for retry.
+        live.state = LiveState::Compensating {
+            pending: pending.clone(),
+            resume: Box::new(resume.clone()),
+        };
+        let outcome = self.compensate(
+            &live.record.identity,
+            &mut pending,
+            Some(TxPoint::AfterRestoreRestore),
+        );
+        if let Err(error) = outcome {
+            let _ = self.retain_compensation(live, pending, resume);
+            return Err(error);
         }
-        self.suppressions.record(&now);
+        live.state = LiveState::Compensating {
+            pending,
+            resume: Box::new(resume),
+        };
+        let record = &live.record;
+        let resource = &record.resource;
         self.journal.remove(&record.lease_id, resource)?;
         self.fire(TxPoint::AfterRestoreJournal)?;
         Ok(())
     }
 
-    /// Crash recovery for one journal record. Only verified state is acted
-    /// on: semantic equality with `before` clears the record, and
-    /// [`Backend::owns_current`] on the applied snapshot restores the
-    /// original. Anything else (including an unverified `Prepared` record
-    /// whose state merely matches `desired`) reports `ExternalConflict`
-    /// without mutating. Memory-only live proof is ignored.
+    /// Recovery uses only published evidence. Prepared may carry backend-issued
+    /// residue that authorizes guarded restoration, without asserting that the
+    /// desired state was verified. Desired-state equality alone and volatile
+    /// live evidence never authorize crash recovery.
     fn recover_record(&self, record: JournalRecord) -> Result<RecoveryOutcome> {
         let resource = record.resource.clone();
         match self.backend.resource_status(&record.identity)? {
@@ -1156,8 +1276,19 @@ impl Inner {
             .as_ref()
             .is_some_and(|applied| self.backend.owns_current(applied, &current));
         if owned {
-            let applied = record.applied.as_ref().expect("applied snapshot");
-            if let Err(error) = self.restore_if_current(&record.identity, applied, &record.before) {
+            let mut pending = PendingRollback {
+                evidence: record.applied.clone(),
+                target: record.before.clone(),
+            };
+            if let Err(error) = self.compensate(
+                &record.identity,
+                &mut pending,
+                Some(TxPoint::AfterRecoveryRestore),
+            ) {
+                let mut retained = record.clone();
+                retained.phase = Phase::Prepared;
+                retained.applied = pending.evidence;
+                self.journal.write(&retained)?;
                 if error.is_external_modification() {
                     return Ok(RecoveryOutcome::ExternalConflict {
                         resource,
@@ -1166,16 +1297,6 @@ impl Inner {
                 }
                 return Err(error);
             }
-            self.fire(TxPoint::AfterRecoveryRestore)?;
-            let now = self.backend.readback(&resource)?;
-            if !self.backend.equivalent(&now, &record.before) {
-                return Err(Error::VerificationFailed {
-                    resource,
-                    detail: "the recovery restore did not read back as the original state"
-                        .to_string(),
-                });
-            }
-            self.suppressions.record(&now);
             self.journal.remove(&record.lease_id, &resource)?;
             self.fire(TxPoint::AfterRecoveryJournal)?;
             return Ok(RecoveryOutcome::Restored {
@@ -1502,17 +1623,10 @@ impl DnsManager {
             Ok(PreparedLease {
                 lease_id,
                 records,
-                verified,
                 was_noop,
             }) => {
-                let lease = Lease::new_owned(
-                    self.inner.clone(),
-                    lease_id,
-                    records,
-                    verified,
-                    locks,
-                    was_noop,
-                );
+                let lease =
+                    Lease::new_owned(self.inner.clone(), lease_id, records, locks, was_noop);
                 if let Err(error) = self.inner.ensure_enforce_watch() {
                     return Err(match lease.restore() {
                         Ok(()) => error,
@@ -1584,9 +1698,10 @@ impl DnsManager {
     ///
     /// Resources locked by an active lease (in this or another process) are
     /// reported as [`RecoveryOutcome::Busy`] and left untouched. Records whose
-    /// current state still matches their verified applied snapshot are
-    /// restored to the original state; records already at the original state
-    /// are simply cleared; anything else — including unverified `Prepared`
+    /// current state still matches published ownership evidence are
+    /// restored to the original state. Prepared evidence may identify an
+    /// incomplete mutation without proving successful application. Records already
+    /// at the original state are simply cleared; anything else — including unverified `Prepared`
     /// records whose state merely matches the desired configuration — is
     /// reported as [`RecoveryOutcome::ExternalConflict`] and kept. Native
     /// resource lifetime is checked before any DNS read. Per-record failures

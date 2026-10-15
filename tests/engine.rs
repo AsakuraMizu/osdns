@@ -517,3 +517,51 @@ fn unfinalized_lease_teardown_checks_identity_and_original_state_first(#[case] t
     assert!(journal_files(&fixture.dir).is_empty());
     assert_eq!(fixture.fake.current_state(IFACE1).unwrap(), external);
 }
+
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+fn compensation_retains_the_identity_issued_by_restoration(#[case] external: bool) {
+    use osdns::testing::FakeOp;
+    let fixture = new_fixture("engine-compensation-identity");
+    let lease = fixture.manager.apply(&config(1, "1.1.1.1")).unwrap();
+    fixture.fake.inject_partial_apply_failure(1);
+    // Update ownership capture, compensation ownership read, then restoration
+    // verification. The restore changes the native generation before failing.
+    fixture
+        .fake
+        .inject_backend_failure_after(FakeOp::Readback, 2, 1, "rollback readback failed");
+    assert!(lease.update(&config(1, "8.8.8.8")).is_err());
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("1.1.1.1"))
+    );
+    assert_eq!(lease.pending_durability(), lease.resources());
+    let record = journal_record_json(&fixture.dir);
+    assert_eq!(record["phase"], "Prepared");
+    assert_eq!(
+        record["applied"]["data"]["generation"].as_u64(),
+        fixture.fake.generation(IFACE1).unwrap()
+    );
+    if external {
+        fixture
+            .fake
+            .external_change(IFACE1, state_with("1.1.1.1"))
+            .unwrap();
+        let generation = fixture.fake.generation(IFACE1).unwrap();
+        assert!(lease.update(&config(1, "9.9.9.9")).is_err());
+        assert_eq!(fixture.fake.generation(IFACE1).unwrap(), generation);
+        lease.abandon().unwrap();
+    } else {
+        lease.update(&config(1, "9.9.9.9")).unwrap();
+        assert_eq!(
+            fixture.fake.current_state(IFACE1).unwrap(),
+            Some(state_with("9.9.9.9"))
+        );
+        lease.restore().unwrap();
+        assert_eq!(
+            fixture.fake.current_state(IFACE1).unwrap(),
+            Some(FakeState::Empty)
+        );
+    }
+}

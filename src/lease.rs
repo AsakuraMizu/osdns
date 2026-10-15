@@ -9,21 +9,42 @@ use crate::error::{ConflictReason, Error, Result};
 use crate::journal::JournalRecord;
 use crate::manager::Inner;
 use crate::ownership::{ResourceId, ResourceLock};
-use crate::platform::OwnershipProof;
 use crate::platform::ResourceStatus;
 
-/// A lease's authoritative, shared journal record.
-///
-/// The record lives behind a mutex so the Enforce-policy reconciler can
-/// rebase `before`/`applied` in place while the lease is alive, keeping the
-/// in-memory state, the journal, and the registry consistent.
+/// Shared transaction intent and its authoritative runtime lifecycle.
+/// `record` is the schema-4 publication payload, not proof of publication.
+/// `state` controls whether it is safe to finalize, compensate, or mutate.
 pub(crate) struct LiveRecord {
     pub(crate) record: JournalRecord,
-    /// Verified mutation identity retained when the durable `Applied` write
-    /// failed. Never serialized; recovery must not see it.
-    pub(crate) verified: Option<OwnershipProof>,
-    /// A failed journal rollback must be persisted before any further mutation.
-    pub(crate) journal_pending: bool,
+    pub(crate) state: LiveState,
+}
+
+/// Runtime progress is separate from the last journal intent. Only `Committed`
+/// permits callers to interpret `record.applied` as a verified active overlay.
+#[derive(Clone)]
+pub(crate) enum LiveState {
+    /// Applied publication completed durably.
+    Committed,
+    /// Durable intent without a verified active overlay.
+    Prepared,
+    /// Desired state was verified; Applied publication remains outstanding.
+    Verified(crate::platform::VerifiedMutation),
+    /// Resolve native residue against its actual evidence and rollback target.
+    Compensating {
+        pending: crate::manager::PendingRollback,
+        resume: Box<JournalRecord>,
+    },
+    /// Publish `record` before interpreting or advancing the enclosed state.
+    Repair(Box<LiveState>),
+}
+
+impl LiveRecord {
+    pub(crate) fn applied(&self) -> Option<&crate::platform::PlatformSnapshot> {
+        match self.state {
+            LiveState::Committed => self.record.applied.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 /// The live state of a [`Lease`]: shared journal records plus the
@@ -99,20 +120,15 @@ impl Lease {
     pub(crate) fn new_owned(
         inner: Arc<Inner>,
         lease_id: Uuid,
-        records: Vec<JournalRecord>,
-        verified: Vec<Option<OwnershipProof>>,
+        records: Vec<LiveRecord>,
         locks: Vec<ResourceLock>,
         was_noop: bool,
     ) -> Self {
         let mut resources = Vec::with_capacity(records.len());
         let mut live = Vec::with_capacity(records.len());
-        for (record, verified) in records.into_iter().zip(verified) {
-            resources.push(record.resource.clone());
-            let shared = Arc::new(Mutex::new(LiveRecord {
-                record,
-                verified,
-                journal_pending: false,
-            }));
+        for record in records {
+            resources.push(record.record.resource.clone());
+            let shared = Arc::new(Mutex::new(record));
             inner.register_active(Arc::clone(&shared));
             live.push(shared);
         }
@@ -129,9 +145,10 @@ impl Lease {
         }
     }
 
-    /// Resources whose journal intent or verified state needs durable persistence.
-    /// Pending journal repair blocks mutation; a crash may leave an ambiguous journal.
-    /// A later update or restore retries finalization; Enforce retries automatically.
+    /// Resources with unfinished native compensation or journal publication.
+    /// Pending state blocks new mutations until it is resolved. A crash may lose
+    /// volatile evidence, leaving conservative recovery unable to restore it.
+    /// Updates and restores retry resolution; Enforce retries automatically.
     pub fn pending_durability(&self) -> Vec<ResourceId> {
         let state = self.state.lock();
         let mut resources = state
@@ -140,10 +157,7 @@ impl Lease {
             .flat_map(|state| &state.live)
             .filter_map(|entry| {
                 let live = entry.lock();
-                (live.journal_pending
-                    || live.verified.is_some()
-                    || live.record.phase == crate::journal::Phase::Prepared)
-                    .then(|| live.record.resource.clone())
+                (!matches!(live.state, LiveState::Committed)).then(|| live.record.resource.clone())
             })
             .collect::<Vec<_>>();
         resources.sort();

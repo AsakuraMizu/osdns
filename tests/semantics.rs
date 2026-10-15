@@ -288,8 +288,10 @@ fn update_failure_restores_previous_state_and_keeps_lease_usable(
     assert!(journal_files(&fixture.dir).is_empty());
 }
 
-#[test]
-fn update_failure_during_rollback_keeps_recoverable_journal() {
+#[rstest::rstest]
+fn update_failure_during_rollback_keeps_recoverable_journal(
+    #[values("restore", "update", "crash")] finish: &str,
+) {
     let (fixture, lease) = three_resource_lease();
     fixture
         .fake
@@ -304,7 +306,14 @@ fn update_failure_during_rollback_keeps_recoverable_journal() {
     for name in journal_files(&fixture.dir) {
         let bytes = std::fs::read(fixture.dir.join("journal").join(name)).unwrap();
         let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(record["phase"], "Applied");
+        assert_eq!(
+            record["phase"],
+            if record["resource"] == IFACE1 {
+                "Prepared"
+            } else {
+                "Applied"
+            }
+        );
         assert_eq!(
             record["applied"]["data"]["state"]["Configured"]["nameservers"][0],
             if record["resource"] == IFACE1 {
@@ -320,7 +329,46 @@ fn update_failure_during_rollback_keeps_recoverable_journal() {
         configured_nameservers(fixture.fake.current_state(&first).unwrap()),
         vec![ip("8.8.8.8")]
     );
-    lease.restore().unwrap();
+    assert_eq!(lease.pending_durability(), vec![resource_id(IFACE1)]);
+    fixture
+        .fake
+        .inject_backend_failure(FakeOp::Restore, 1, "compensation still unavailable");
+    let generations: Vec<_> = lease
+        .resources()
+        .iter()
+        .map(|r| fixture.fake.generation(r.as_str()).unwrap())
+        .collect();
+    assert!(lease.update(&updated_three("9.9.9.9")).is_err());
+    for (resource, generation) in lease.resources().iter().zip(generations) {
+        assert_eq!(
+            fixture.fake.generation(resource.as_str()).unwrap(),
+            generation
+        );
+    }
+    match finish {
+        "update" => {
+            lease.update(&updated_three("9.9.9.9")).unwrap();
+            for resource in lease.resources() {
+                assert_eq!(
+                    configured_nameservers(fixture.fake.current_state(resource.as_str()).unwrap()),
+                    vec![ip("9.9.9.9")]
+                );
+            }
+            lease.restore().unwrap();
+        }
+        "restore" => lease.restore().unwrap(),
+        "crash" => {
+            lease.debug_release_locks_keep_journal();
+            let outcomes = fixture.manager.recover_stale().unwrap();
+            assert_eq!(outcomes.len(), 3);
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|outcome| matches!(outcome, osdns::RecoveryOutcome::Restored { .. }))
+            );
+        }
+        _ => unreachable!(),
+    }
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
         Some(osdns::testing::FakeState::Empty)

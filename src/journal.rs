@@ -45,6 +45,9 @@ pub(crate) struct JournalRecord {
     pub(crate) phase: Phase,
     pub(crate) before: PlatformSnapshot,
     pub(crate) desired: NormalizedConfig,
+    /// In Applied, the verified mutation. In Prepared, optional recovery
+    /// evidence from a prior or incomplete mutation, never proof that `desired`
+    /// was verified. Only successfully published evidence survives a crash.
     pub(crate) applied: Option<PlatformSnapshot>,
 }
 

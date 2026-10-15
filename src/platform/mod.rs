@@ -149,10 +149,6 @@ impl OwnershipProof {
     pub(crate) fn as_snapshot(&self) -> &PlatformSnapshot {
         &self.snapshot
     }
-
-    pub(crate) fn into_snapshot(self) -> PlatformSnapshot {
-        self.snapshot
-    }
 }
 
 /// A mutation that matched the desired configuration on read-back.

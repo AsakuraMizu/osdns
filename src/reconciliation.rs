@@ -42,7 +42,7 @@ use parking_lot::Mutex;
 use crate::error::Error;
 use crate::fault::TxPoint;
 use crate::journal::Phase;
-use crate::lease::LiveRecord;
+use crate::lease::{LiveRecord, LiveState};
 use crate::manager::{Inner, RECONCILE_POINTS};
 use crate::normalize::NormalizedConfig;
 use crate::ownership::ResourceId;
@@ -322,6 +322,18 @@ impl Inner {
         entry: &Arc<Mutex<LiveRecord>>,
         reconciler: &Reconciler,
     ) -> ReconcileOutcome {
+        {
+            let mut live = entry.lock();
+            if let Err(error) = self.resolve_live(&mut live, None)
+                && !matches!(live.state, LiveState::Prepared)
+            {
+                return if error.is_external_modification() {
+                    ReconcileOutcome::Deferred
+                } else {
+                    ReconcileOutcome::Failed
+                };
+            }
+        }
         let first = match self.backend.readback(resource) {
             Ok(first) => first,
             Err(Error::ResourceGone { .. }) => {
@@ -365,21 +377,15 @@ impl Inner {
             return ReconcileOutcome::Deferred;
         }
 
-        let mut guard = entry.lock();
+        let guard = entry.lock();
 
-        match self.finalize_live(&mut guard, Some(&second)) {
-            Ok(()) => {}
-            Err(error) if error.is_external_modification() => {
-                if guard.record.phase == Phase::Prepared
-                    && !self.backend.equivalent(&second, &guard.record.before)
-                {
-                    return ReconcileOutcome::Deferred;
-                }
-            }
-            Err(_) => return ReconcileOutcome::Failed,
+        if matches!(guard.state, LiveState::Prepared)
+            && !self.backend.equivalent(&second, &guard.record.before)
+        {
+            return ReconcileOutcome::Deferred;
         }
 
-        if let Some(applied) = &guard.record.applied
+        if let Some(applied) = guard.applied()
             && self.backend.owns_current(applied, &second)
         {
             if self.backend.matches_desired(&second, &guard.record.desired) {
@@ -387,10 +393,10 @@ impl Inner {
             }
             let desired = guard.record.desired.clone();
             drop(guard);
-            return self.apply_overlay(resource, entry, &second, &desired, &second);
+            return self.apply_overlay(entry, &second, &desired);
         }
 
-        if let Some(applied) = &guard.record.applied
+        if let Some(applied) = guard.applied()
             && self.backend.matches_desired(&second, &guard.record.desired)
             && !self.backend.owns_current(applied, &second)
         {
@@ -402,7 +408,7 @@ impl Inner {
             let desired = guard.record.desired.clone();
             let expected = second.clone();
             drop(guard);
-            return self.apply_overlay(resource, entry, &expected, &desired, &expected);
+            return self.apply_overlay(entry, &expected, &desired);
         }
 
         drop(guard);
@@ -415,108 +421,71 @@ impl Inner {
             );
             return ReconcileOutcome::Deferred;
         }
-        self.rebase_transaction(resource, entry, &second)
+        self.rebase_transaction(entry, &second)
     }
 
     fn apply_overlay(
         &self,
-        resource: &ResourceId,
         entry: &Arc<Mutex<LiveRecord>>,
         expected: &PlatformSnapshot,
         desired: &NormalizedConfig,
-        rollback_to: &PlatformSnapshot,
     ) -> ReconcileOutcome {
-        let mut residue = crate::manager::MutationResidue::new();
+        let resume = {
+            let mut live = entry.lock();
+            let mut candidate = live.record.clone();
+            candidate.phase = Phase::Prepared;
+            candidate.applied = None;
+            if !matches!(live.state, LiveState::Prepared)
+                && self.prepare_live(&mut live, candidate.clone()).is_err()
+            {
+                return ReconcileOutcome::Failed;
+            }
+            candidate
+        };
+        if self.fire(TxPoint::AfterPrepared).is_err() {
+            return ReconcileOutcome::Deferred;
+        }
         let identity = entry.lock().record.identity.clone();
-        match self.mutate_and_verify(
-            &identity,
-            expected,
-            desired,
-            Some(rollback_to),
-            RECONCILE_POINTS,
-            &mut residue,
-        ) {
-            Ok(mutation) => self.commit_applied(resource, entry, mutation),
-            Err(_) => {
-                if residue.leftover.is_some() {
-                    entry.lock().verified = residue.leftover;
+        match self.mutate_and_verify(&identity, expected, desired, RECONCILE_POINTS) {
+            Ok(mutation) => {
+                if self.commit_verified(&mut entry.lock(), mutation).is_err() {
+                    ReconcileOutcome::Failed
+                } else {
+                    let _ = self.fire(TxPoint::AfterApplied);
+                    ReconcileOutcome::Rebased
+                }
+            }
+            Err(failure) => {
+                if let crate::manager::MutationResidue::Pending(pending) = failure.residue {
+                    // Keep residue volatile until resolution or teardown. A crash
+                    // before evidence publication must remain fail-closed.
+                    entry.lock().state = LiveState::Compensating {
+                        pending,
+                        resume: Box::new(resume),
+                    };
                 }
                 ReconcileOutcome::Failed
             }
         }
     }
 
-    #[allow(unused_variables)]
-    fn commit_applied(
-        &self,
-        resource: &ResourceId,
-        entry: &Arc<Mutex<LiveRecord>>,
-        mutation: crate::platform::VerifiedMutation,
-    ) -> ReconcileOutcome {
-        let persisted = mutation.persist();
-        let mut live = entry.lock();
-        live.record.applied = Some(persisted.clone());
-        live.record.phase = Phase::Applied;
-        match self.journal.write(&live.record) {
-            Ok(()) => {
-                live.verified = None;
-                drop(live);
-                let _ = self.fire(TxPoint::AfterApplied);
-                ReconcileOutcome::Rebased
-            }
-            Err(error) => {
-                osdns_warn!(
-                    resource = %resource,
-                    error = %error,
-                    "mutation was verified but the Applied journal write failed; deferring"
-                );
-                live.verified = mutation
-                    .proof
-                    .or(Some(crate::platform::OwnershipProof::issued(persisted)));
-                live.record.applied = None;
-                live.record.phase = Phase::Prepared;
-                ReconcileOutcome::Failed
-            }
-        }
-    }
-
-    #[allow(unused_variables)]
     fn rebase_transaction(
         &self,
-        resource: &ResourceId,
         entry: &Arc<Mutex<LiveRecord>>,
         external_base: &PlatformSnapshot,
     ) -> ReconcileOutcome {
         {
             let mut live = entry.lock();
-            let old = live.record.clone();
-            let old_verified = live.verified.clone();
-            live.record.before = external_base.clone();
-            live.record.applied = None;
-            live.record.phase = Phase::Prepared;
-            live.verified = None;
-            if let Err(error) = self.journal.write(&live.record) {
-                osdns_warn!(
-                    resource = %resource,
-                    error = %error,
-                    "Prepared rebase publication failed; attempting journal rollback"
-                );
-                live.record = old;
-                live.verified = old_verified;
-                if let Err(cleanup) = self.journal.write(&live.record) {
-                    live.journal_pending = true;
-                    osdns_warn!(resource = %resource, error = %error, cleanup = %cleanup,
-                        "rebase journal rollback is indeterminate; blocking mutation until repaired");
-                }
+            let mut candidate = live.record.clone();
+            candidate.before = external_base.clone();
+            candidate.applied = None;
+            candidate.phase = Phase::Prepared;
+            if self.prepare_live(&mut live, candidate).is_err() {
                 return ReconcileOutcome::Failed;
             }
         }
-        if self.fire(TxPoint::AfterPrepared).is_err() {
-            return ReconcileOutcome::Deferred;
-        }
-
         let desired = entry.lock().record.desired.clone();
-        self.apply_overlay(resource, entry, external_base, &desired, external_base)
+        self.apply_overlay(entry, external_base, &desired)
     }
 }
 
